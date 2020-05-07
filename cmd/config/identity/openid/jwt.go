@@ -30,6 +30,7 @@ import (
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/env"
+	"github.com/minio/minio/pkg/iam/policy"
 	xnet "github.com/minio/minio/pkg/net"
 )
 
@@ -41,6 +42,7 @@ type Config struct {
 	} `json:"jwks"`
 	URL          *xnet.URL `json:"url,omitempty"`
 	ClaimPrefix  string    `json:"claimPrefix,omitempty"`
+	ClaimName    string    `json:"claimName,omitempty"`
 	DiscoveryDoc DiscoveryDoc
 	ClientID     string
 	publicKeys   map[string]crypto.PublicKey
@@ -166,7 +168,10 @@ func updateClaimsExpiry(dsecs string, claims map[string]interface{}) error {
 // Validate - validates the access token.
 func (p *JWT) Validate(token, dsecs string) (map[string]interface{}, error) {
 	jp := new(jwtgo.Parser)
-	jp.ValidMethods = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+	jp.ValidMethods = []string{
+		"RS256", "RS384", "RS512", "ES256", "ES384", "ES512",
+		"RS3256", "RS3384", "RS3512", "ES3256", "ES3384", "ES3512",
+	}
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (interface{}, error) {
 		kid, ok := jwtToken.Header["kid"].(string)
@@ -209,12 +214,14 @@ func (p *JWT) ID() ID {
 const (
 	JwksURL     = "jwks_url"
 	ConfigURL   = "config_url"
+	ClaimName   = "claim_name"
 	ClaimPrefix = "claim_prefix"
 	ClientID    = "client_id"
 
 	EnvIdentityOpenIDClientID    = "MINIO_IDENTITY_OPENID_CLIENT_ID"
 	EnvIdentityOpenIDJWKSURL     = "MINIO_IDENTITY_OPENID_JWKS_URL"
 	EnvIdentityOpenIDURL         = "MINIO_IDENTITY_OPENID_CONFIG_URL"
+	EnvIdentityOpenIDClaimName   = "MINIO_IDENTITY_OPENID_CLAIM_NAME"
 	EnvIdentityOpenIDClaimPrefix = "MINIO_IDENTITY_OPENID_CLAIM_PREFIX"
 )
 
@@ -247,6 +254,7 @@ func parseDiscoveryDoc(u *xnet.URL, transport *http.Transport, closeRespFn func(
 	}
 	resp, err := clnt.Do(req)
 	if err != nil {
+		clnt.CloseIdleConnections()
 		return d, err
 	}
 	defer closeRespFn(resp.Body)
@@ -270,6 +278,10 @@ var (
 		config.KV{
 			Key:   ClientID,
 			Value: "",
+		},
+		config.KV{
+			Key:   ClaimName,
+			Value: iampolicy.PolicyName,
 		},
 		config.KV{
 			Key:   ClaimPrefix,
@@ -299,6 +311,7 @@ func LookupConfig(kvs config.KVS, transport *http.Transport, closeRespFn func(io
 	}
 
 	c = Config{
+		ClaimName:   env.Get(EnvIdentityOpenIDClaimName, kvs.Get(ClaimName)),
 		ClaimPrefix: env.Get(EnvIdentityOpenIDClaimPrefix, kvs.Get(ClaimPrefix)),
 		publicKeys:  make(map[string]crypto.PublicKey),
 		ClientID:    env.Get(EnvIdentityOpenIDClientID, kvs.Get(ClientID)),
@@ -317,6 +330,11 @@ func LookupConfig(kvs config.KVS, transport *http.Transport, closeRespFn func(io
 			return c, err
 		}
 	}
+
+	if c.ClaimName == "" {
+		c.ClaimName = iampolicy.PolicyName
+	}
+
 	if jwksURL == "" {
 		// Fallback to discovery document jwksURL
 		jwksURL = c.DiscoveryDoc.JwksURI
@@ -330,9 +348,11 @@ func LookupConfig(kvs config.KVS, transport *http.Transport, closeRespFn func(io
 	if err != nil {
 		return c, err
 	}
+
 	if err = c.PopulatePublicKey(); err != nil {
 		return c, err
 	}
+
 	return c, nil
 }
 

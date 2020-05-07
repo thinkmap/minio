@@ -22,9 +22,12 @@ import (
 	"net/http"
 
 	"github.com/minio/minio-go/v6/pkg/encrypt"
-	"github.com/minio/minio/pkg/lifecycle"
+	"github.com/minio/minio-go/v6/pkg/tags"
+	bucketsse "github.com/minio/minio/pkg/bucket/encryption"
+	"github.com/minio/minio/pkg/bucket/lifecycle"
+	"github.com/minio/minio/pkg/bucket/policy"
+
 	"github.com/minio/minio/pkg/madmin"
-	"github.com/minio/minio/pkg/policy"
 )
 
 // CheckCopyPreconditionFn returns true if copy precondition check failed.
@@ -37,6 +40,7 @@ type GetObjectInfoFn func(ctx context.Context, bucket, object string, opts Objec
 type ObjectOptions struct {
 	ServerSideEncryption encrypt.ServerSide
 	UserDefined          map[string]string
+	PartNumber           int
 	CheckCopyPrecondFn   CheckCopyPreconditionFn
 }
 
@@ -52,19 +56,21 @@ const (
 // ObjectLayer implements primitives for object API layer.
 type ObjectLayer interface {
 	// Locking operations on object.
-	NewNSLock(ctx context.Context, bucket string, object string) RWLocker
+	NewNSLock(ctx context.Context, bucket string, objects ...string) RWLocker
 
 	// Storage operations.
 	Shutdown(context.Context) error
-	StorageInfo(context.Context) StorageInfo
+	CrawlAndGetDataUsage(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo) error
+	StorageInfo(ctx context.Context, local bool) StorageInfo // local queries only local disks
 
 	// Bucket operations.
 	MakeBucketWithLocation(ctx context.Context, bucket string, location string) error
 	GetBucketInfo(ctx context.Context, bucket string) (bucketInfo BucketInfo, err error)
 	ListBuckets(ctx context.Context) (buckets []BucketInfo, err error)
-	DeleteBucket(ctx context.Context, bucket string) error
+	DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error
 	ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (result ListObjectsInfo, err error)
 	ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (result ListObjectsV2Info, err error)
+	Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo) error
 
 	// Object operations.
 
@@ -96,11 +102,10 @@ type ObjectLayer interface {
 	ReloadFormat(ctx context.Context, dryRun bool) error
 	HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error)
 	HealBucket(ctx context.Context, bucket string, dryRun, remove bool) (madmin.HealResultItem, error)
-	HealObject(ctx context.Context, bucket, object string, dryRun, remove bool, scanMode madmin.HealScanMode) (madmin.HealResultItem, error)
-	HealObjects(ctx context.Context, bucket, prefix string, healObjectFn func(string, string) error) error
+	HealObject(ctx context.Context, bucket, object string, opts madmin.HealOpts) (madmin.HealResultItem, error)
+	HealObjects(ctx context.Context, bucket, prefix string, opts madmin.HealOpts, fn healObjectFn) error
 
 	ListBucketsHeal(ctx context.Context) (buckets []BucketInfo, err error)
-	ListObjectsHeal(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (result ListObjectsInfo, err error)
 
 	// Policy operations
 	SetBucketPolicy(context.Context, string, *policy.Policy) error
@@ -120,6 +125,19 @@ type ObjectLayer interface {
 	GetBucketLifecycle(context.Context, string) (*lifecycle.Lifecycle, error)
 	DeleteBucketLifecycle(context.Context, string) error
 
+	// Bucket Encryption operations
+	SetBucketSSEConfig(context.Context, string, *bucketsse.BucketSSEConfig) error
+	GetBucketSSEConfig(context.Context, string) (*bucketsse.BucketSSEConfig, error)
+	DeleteBucketSSEConfig(context.Context, string) error
+
 	// Backend related metrics
 	GetMetrics(ctx context.Context) (*Metrics, error)
+
+	// Check Readiness
+	IsReady(ctx context.Context) bool
+
+	// ObjectTagging operations
+	PutObjectTag(context.Context, string, string, string) error
+	GetObjectTag(context.Context, string, string) (*tags.Tags, error)
+	DeleteObjectTag(context.Context, string, string) error
 }

@@ -34,10 +34,12 @@ USER ci
 RUN make
 RUN bash -c 'diff -au <(gofmt -s -d cmd) <(printf "")'
 RUN bash -c 'diff -au <(gofmt -s -d pkg) <(printf "")'
-RUN for d in $(go list ./... | grep -v browser); do go test -v -race --timeout 20m "$d"; done
-RUN make verifiers
+RUN make test-race
 RUN make crosscompile
 RUN make verify
+
+## -- add healing tests
+RUN make verify-healing
 
 #-------------------------------------------------------------
 # Stage 2: Test Frontend
@@ -55,7 +57,7 @@ RUN yarn test
 #-------------------------------------------------------------
 # Stage 3: Run Gateway Tests
 #-------------------------------------------------------------
-FROM ubuntu:16.04
+FROM ubuntu:18.04
 
 COPY --from=0 /go/src/github.com/minio/minio/minio /usr/bin/minio
 COPY buildscripts/gateway-tests.sh /usr/bin/gateway-tests.sh
@@ -64,7 +66,7 @@ COPY mint /mint
 ENV DEBIAN_FRONTEND noninteractive
 ENV LANG C.UTF-8
 ENV GOROOT /usr/local/go
-ENV GOPATH /usr/local
+ENV GOPATH /usr/local/gopath
 ENV PATH $GOPATH/bin:$GOROOT/bin:$PATH
 ENV SIMPLE_CI 1
 ENV MINT_ROOT_DIR /mint

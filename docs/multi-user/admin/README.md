@@ -82,8 +82,16 @@ mc admin policy set myminio-admin1 user1policy user=user1
 - admin:GetUser
 
 #### Service management permissions
-- admin:ListServerInfo
+- admin:ServerInfo
 - admin:ServerUpdate
+- admin:StorageInfo
+- admin:DataUsageInfo
+- admin:TopLocks
+- admin:OBDInfo
+- admin:Profiling,
+- admin:ServerTrace
+- admin:ConsoleLog
+- admin:KMSKeyStatus
 
 #### User/Group management permissions
 - admin:AddUserToGroup

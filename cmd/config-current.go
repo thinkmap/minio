@@ -17,16 +17,15 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/config/api"
 	"github.com/minio/minio/cmd/config/cache"
 	"github.com/minio/minio/cmd/config/compress"
 	"github.com/minio/minio/cmd/config/etcd"
-	xetcd "github.com/minio/minio/cmd/config/etcd"
 	"github.com/minio/minio/cmd/config/etcd/dns"
 	xldap "github.com/minio/minio/cmd/config/identity/ldap"
 	"github.com/minio/minio/cmd/config/identity/openid"
@@ -38,6 +37,7 @@ import (
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/cmd/logger/target/http"
 	"github.com/minio/minio/pkg/env"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 func initHelp() {
@@ -49,6 +49,7 @@ func initHelp() {
 		config.IdentityOpenIDSubSys: openid.DefaultKVS,
 		config.PolicyOPASubSys:      opa.DefaultKVS,
 		config.RegionSubSys:         config.DefaultRegionKVS,
+		config.APISubSys:            api.DefaultKVS,
 		config.CredentialsSubSys:    config.DefaultCredentialKVS,
 		config.KmsVaultSubSys:       crypto.DefaultVaultKVS,
 		config.KmsKesSubSys:         crypto.DefaultKesKVS,
@@ -100,6 +101,10 @@ func initHelp() {
 		config.HelpKV{
 			Key:         config.KmsKesSubSys,
 			Description: "enable external MinIO key encryption service",
+		},
+		config.HelpKV{
+			Key:         config.APISubSys,
+			Description: "manage global HTTP API call specific features, such as throttling, authentication types, etc.",
 		},
 		config.HelpKV{
 			Key:             config.LoggerWebhookSubSys,
@@ -175,6 +180,7 @@ func initHelp() {
 	var helpMap = map[string]config.HelpKVS{
 		"":                          helpSubSys, // Help for all sub-systems.
 		config.RegionSubSys:         config.RegionHelp,
+		config.APISubSys:            api.Help,
 		config.StorageClassSubSys:   storageclass.Help,
 		config.EtcdSubSys:           etcd.Help,
 		config.CacheSubSys:          cache.Help,
@@ -222,6 +228,10 @@ func validateConfig(s config.Config) error {
 		return err
 	}
 
+	if _, err := api.LookupConfig(s[config.APISubSys][config.Default]); err != nil {
+		return err
+	}
+
 	if globalIsXL {
 		if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default],
 			globalXLSetDriveCount); err != nil {
@@ -251,7 +261,7 @@ func validateConfig(s config.Config) error {
 		}
 	}
 	{
-		kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), NewCustomHTTPTransport())
+		kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), NewGatewayHTTPTransport())
 		if err != nil {
 			return err
 		}
@@ -269,17 +279,27 @@ func validateConfig(s config.Config) error {
 	}
 
 	if _, err := openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody); err != nil {
+		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
 		return err
 	}
 
-	if _, err := xldap.Lookup(s[config.IdentityLDAPSubSys][config.Default],
-		globalRootCAs); err != nil {
-		return err
+	{
+		cfg, err := xldap.Lookup(s[config.IdentityLDAPSubSys][config.Default],
+			globalRootCAs)
+		if err != nil {
+			return err
+		}
+		if cfg.Enabled {
+			conn, cerr := cfg.Connect()
+			if cerr != nil {
+				return cerr
+			}
+			conn.Close()
+		}
 	}
 
 	if _, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody); err != nil {
+		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
 		return err
 	}
 
@@ -287,12 +307,12 @@ func validateConfig(s config.Config) error {
 		return err
 	}
 
-	return notify.TestNotificationTargets(s, GlobalServiceDoneCh, NewCustomHTTPTransport(),
+	return notify.TestNotificationTargets(s, GlobalContext.Done(), NewGatewayHTTPTransport(),
 		globalNotificationSys.ConfiguredTargetIDs())
 }
 
 func lookupConfigs(s config.Config) {
-	ctx := context.Background()
+	ctx := GlobalContext
 
 	var err error
 	if !globalActiveCred.IsValid() {
@@ -303,17 +323,24 @@ func lookupConfigs(s config.Config) {
 		}
 	}
 
-	etcdCfg, err := xetcd.LookupConfig(s[config.EtcdSubSys][config.Default], globalRootCAs)
+	etcdCfg, err := etcd.LookupConfig(s[config.EtcdSubSys][config.Default], globalRootCAs)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
 	}
 
 	if etcdCfg.Enabled {
-		globalEtcdClient, err = xetcd.New(etcdCfg)
+		globalEtcdClient, err = etcd.New(etcdCfg)
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
 		}
 	}
+
+	// Bucket federation is 'true' only when IAM assets are not namespaced
+	// per tenant and all tenants interested in globally available users
+	// if namespace was requested such as specifying etcdPathPrefix then
+	// we assume that users are interested in global bucket support
+	// but not federation.
+	globalBucketFederation = etcdCfg.PathPrefix == "" && etcdCfg.Enabled
 
 	if len(globalDomainNames) != 0 && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
 		globalDNSConfig, err = dns.NewCoreDNS(etcdCfg.Config,
@@ -332,6 +359,18 @@ func lookupConfigs(s config.Config) {
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Invalid region configuration: %w", err))
 	}
+
+	apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
+	}
+
+	apiRequestsMax := apiConfig.APIRequestsMax
+	if len(globalEndpoints.Hosts()) > 0 {
+		apiRequestsMax /= len(globalEndpoints.Hosts())
+	}
+
+	globalAPIThrottling.init(apiRequestsMax, apiConfig.APIRequestsDeadline)
 
 	if globalIsXL {
 		globalStorageClass, err = storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default],
@@ -355,7 +394,7 @@ func lookupConfigs(s config.Config) {
 		}
 	}
 
-	kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), NewCustomHTTPTransport())
+	kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), NewGatewayHTTPTransport())
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to setup KMS config: %w", err))
 	}
@@ -374,13 +413,13 @@ func lookupConfigs(s config.Config) {
 	}
 
 	globalOpenIDConfig, err = openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody)
+		NewGatewayHTTPTransport(), xhttp.DrainBody)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize OpenID: %w", err))
 	}
 
 	opaCfg, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
-		NewCustomHTTPTransport(), xhttp.DrainBody)
+		NewGatewayHTTPTransport(), xhttp.DrainBody)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize OPA: %w", err))
 	}
@@ -405,18 +444,37 @@ func lookupConfigs(s config.Config) {
 	for _, l := range loggerCfg.HTTP {
 		if l.Enabled {
 			// Enable http logging
-			logger.AddTarget(http.New(l.Endpoint, loggerUserAgent, string(logger.All), NewCustomHTTPTransport()))
+			logger.AddTarget(
+				http.New(http.WithEndpoint(l.Endpoint),
+					http.WithAuthToken(l.AuthToken),
+					http.WithUserAgent(loggerUserAgent),
+					http.WithLogKind(string(logger.All)),
+					http.WithTransport(NewGatewayHTTPTransport()),
+				),
+			)
 		}
 	}
 
 	for _, l := range loggerCfg.Audit {
 		if l.Enabled {
 			// Enable http audit logging
-			logger.AddAuditTarget(http.New(l.Endpoint, loggerUserAgent, string(logger.All), NewCustomHTTPTransport()))
+			logger.AddAuditTarget(
+				http.New(http.WithEndpoint(l.Endpoint),
+					http.WithAuthToken(l.AuthToken),
+					http.WithUserAgent(loggerUserAgent),
+					http.WithLogKind(string(logger.All)),
+					http.WithTransport(NewGatewayHTTPTransport()),
+				),
+			)
 		}
 	}
 
-	globalConfigTargetList, err = notify.GetNotificationTargets(s, GlobalServiceDoneCh, NewCustomHTTPTransport())
+	globalConfigTargetList, err = notify.GetNotificationTargets(s, GlobalContext.Done(), NewGatewayHTTPTransport())
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
+	}
+
+	globalEnvTargetList, err = notify.GetNotificationTargets(newServerConfig(), GlobalContext.Done(), NewGatewayHTTPTransport())
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
 	}
@@ -462,6 +520,20 @@ func GetHelp(subSys, key string, envOnly bool) (Help, error) {
 
 	envHelp := config.HelpKVS{}
 	if envOnly {
+		// Only for multiple targets, make sure
+		// to list the ENV, for regular k/v EnableKey is
+		// implicit, for ENVs we cannot make it implicit.
+		if subSysHelp.MultipleTargets {
+			envK := config.EnvPrefix + strings.Join([]string{
+				strings.ToTitle(subSys), strings.ToTitle(madmin.EnableKey),
+			}, config.EnvWordDelimiter)
+			envHelp = append(envHelp, config.HelpKV{
+				Key:         envK,
+				Description: fmt.Sprintf("enable %s target, default is 'off'", subSys),
+				Optional:    false,
+				Type:        "on|off",
+			})
+		}
 		for _, hkv := range h {
 			envK := config.EnvPrefix + strings.Join([]string{
 				strings.ToTitle(subSys), strings.ToTitle(hkv.Key),
@@ -503,11 +575,11 @@ func newSrvConfig(objAPI ObjectLayer) error {
 	globalServerConfigMu.Unlock()
 
 	// Save config into file.
-	return saveServerConfig(context.Background(), objAPI, globalServerConfig)
+	return saveServerConfig(GlobalContext, objAPI, globalServerConfig)
 }
 
 func getValidConfig(objAPI ObjectLayer) (config.Config, error) {
-	return readServerConfig(context.Background(), objAPI)
+	return readServerConfig(GlobalContext, objAPI)
 }
 
 // loadConfig - loads a new config from disk, overrides params

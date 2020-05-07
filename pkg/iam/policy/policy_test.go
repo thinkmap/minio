@@ -22,8 +22,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/minio/minio/pkg/policy"
-	"github.com/minio/minio/pkg/policy/condition"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
 )
 
 func TestPolicyIsAllowed(t *testing.T) {
@@ -338,6 +338,24 @@ func TestPolicyIsValid(t *testing.T) {
 		},
 	}
 
+	case8Policy := Policy{
+		Version: DefaultVersion,
+		Statements: []Statement{
+			NewStatement(
+				policy.Allow,
+				NewActionSet(PutObjectAction),
+				NewResourceSet(NewResource("mybucket", "/myobject*")),
+				condition.NewFunctions(),
+			),
+			NewStatement(
+				policy.Allow,
+				NewActionSet(PutObjectAction),
+				NewResourceSet(NewResource("mybucket", "/myobject*")),
+				condition.NewFunctions(),
+			),
+		},
+	}
+
 	testCases := []struct {
 		policy    Policy
 		expectErr bool
@@ -353,8 +371,10 @@ func TestPolicyIsValid(t *testing.T) {
 		{case5Policy, true},
 		// Invalid statement error.
 		{case6Policy, true},
-		// Duplicate statement error.
-		{case7Policy, true},
+		// Duplicate statement different Effects.
+		{case7Policy, false},
+		// Duplicate statement same Effects, duplicate effect will be removed.
+		{case8Policy, false},
 	}
 
 	for i, testCase := range testCases {
@@ -903,6 +923,18 @@ func TestPolicyUnmarshalJSON(t *testing.T) {
         }
     ]
 }`)
+	case10Policy := Policy{
+		ID:      "MyPolicyForMyBucket1",
+		Version: DefaultVersion,
+		Statements: []Statement{
+			NewStatement(
+				policy.Allow,
+				NewActionSet(PutObjectAction),
+				NewResourceSet(NewResource("mybucket", "myobject*")),
+				condition.NewFunctions(),
+			),
+		},
+	}
 
 	case11Data := []byte(`{
     "ID": "MyPolicyForMyBucket1",
@@ -921,6 +953,25 @@ func TestPolicyUnmarshalJSON(t *testing.T) {
     ]
 }`)
 
+	case11Policy := Policy{
+		ID:      "MyPolicyForMyBucket1",
+		Version: DefaultVersion,
+		Statements: []Statement{
+			NewStatement(
+				policy.Allow,
+				NewActionSet(PutObjectAction),
+				NewResourceSet(NewResource("mybucket", "myobject*")),
+				condition.NewFunctions(),
+			),
+			NewStatement(
+				policy.Deny,
+				NewActionSet(PutObjectAction),
+				NewResourceSet(NewResource("mybucket", "myobject*")),
+				condition.NewFunctions(),
+			),
+		},
+	}
+
 	testCases := []struct {
 		data           []byte
 		expectedResult Policy
@@ -936,10 +987,10 @@ func TestPolicyUnmarshalJSON(t *testing.T) {
 		{case8Data, case8Policy, false},
 		// Invalid version error.
 		{case9Data, Policy{}, true},
-		// Duplicate statement error.
-		{case10Data, Policy{}, true},
-		// Duplicate statement error (Effect differs).
-		{case11Data, Policy{}, true},
+		// Duplicate statement success, duplicate statement is removed.
+		{case10Data, case10Policy, false},
+		// Duplicate statement success (Effect differs).
+		{case11Data, case11Policy, false},
 	}
 
 	for i, testCase := range testCases {
@@ -948,12 +999,12 @@ func TestPolicyUnmarshalJSON(t *testing.T) {
 		expectErr := (err != nil)
 
 		if expectErr != testCase.expectErr {
-			t.Fatalf("case %v: error: expected: %v, got: %v", i+1, testCase.expectErr, expectErr)
+			t.Errorf("case %v: error: expected: %v, got: %v", i+1, testCase.expectErr, expectErr)
 		}
 
 		if !testCase.expectErr {
 			if !reflect.DeepEqual(result, testCase.expectedResult) {
-				t.Fatalf("case %v: result: expected: %v, got: %v", i+1, testCase.expectedResult, result)
+				t.Errorf("case %v: result: expected: %v, got: %v", i+1, testCase.expectedResult, result)
 			}
 		}
 	}

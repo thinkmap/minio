@@ -36,11 +36,12 @@ import (
 	jwtgo "github.com/dgrijalva/jwt-go"
 	humanize "github.com/dustin/go-humanize"
 	miniogopolicy "github.com/minio/minio-go/v6/pkg/policy"
+	xjwt "github.com/minio/minio/cmd/jwt"
 	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
 	"github.com/minio/minio/pkg/hash"
 	"github.com/minio/minio/pkg/madmin"
-	"github.com/minio/minio/pkg/policy"
-	"github.com/minio/minio/pkg/policy/condition"
 )
 
 // Implement a dummy flush writer.
@@ -241,6 +242,7 @@ func testServerInfoWebHandler(obj ObjectLayer, instanceType string, t TestErrHan
 	if serverInfoReply.MinioVersion != Version {
 		t.Fatalf("Cannot get minio version from server info handler")
 	}
+	serverInfoReply.MinioGlobalInfo["domains"] = []string(nil)
 	globalInfo := getGlobalInfo()
 	if !reflect.DeepEqual(serverInfoReply.MinioGlobalInfo, globalInfo) {
 		t.Fatalf("Global info did not match got %#v, expected %#v", serverInfoReply.MinioGlobalInfo, globalInfo)
@@ -448,7 +450,7 @@ func testListBucketsWebHandler(obj ObjectLayer, instanceType string, t TestErrHa
 		t.Fatalf("Cannot find the bucket already created by MakeBucket")
 	}
 	if listBucketsReply.Buckets[0].Name != bucketName {
-		t.Fatalf("Found another bucket other than already created by MakeBucket")
+		t.Fatalf("Found another bucket %q other than already created by MakeBucket", listBucketsReply.Buckets[0].Name)
 	}
 }
 
@@ -546,7 +548,7 @@ func testListObjectsWebHandler(obj ObjectLayer, instanceType string, t TestErrHa
 	if err = obj.SetBucketPolicy(context.Background(), bucketName, bucketPolicy); err != nil {
 		t.Fatalf("unexpected error. %v", err)
 	}
-	globalPolicySys.Set(bucketName, *bucketPolicy)
+	globalPolicySys.Set(bucketName, bucketPolicy)
 	defer globalPolicySys.Remove(bucketName)
 
 	// Unauthenticated ListObjects with READ bucket policy should succeed.
@@ -753,12 +755,10 @@ func TestWebCreateURLToken(t *testing.T) {
 }
 
 func getTokenString(accessKey, secretKey string) (string, error) {
-	utcNow := UTCNow()
-	mapClaims := jwtgo.MapClaims{}
-	mapClaims["exp"] = utcNow.Add(defaultJWTExpiry).Unix()
-	mapClaims["sub"] = accessKey
-	mapClaims["accessKey"] = accessKey
-	token := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, mapClaims)
+	claims := xjwt.NewMapClaims()
+	claims.SetExpiry(UTCNow().Add(defaultJWTExpiry))
+	claims.SetAccessKey(accessKey)
+	token := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, claims)
 	return token.SignedString([]byte(secretKey))
 }
 
@@ -906,7 +906,7 @@ func testUploadWebHandler(obj ObjectLayer, instanceType string, t TestErrHandler
 	if err := obj.SetBucketPolicy(context.Background(), bucketName, bucketPolicy); err != nil {
 		t.Fatalf("unexpected error. %v", err)
 	}
-	globalPolicySys.Set(bucketName, *bucketPolicy)
+	globalPolicySys.Set(bucketName, bucketPolicy)
 	defer globalPolicySys.Remove(bucketName)
 
 	// Unauthenticated upload with WRITE policy should succeed.
@@ -1002,7 +1002,7 @@ func testDownloadWebHandler(obj ObjectLayer, instanceType string, t TestErrHandl
 	}
 
 	if !bytes.Equal(bodyContent, bytes.NewBufferString("Authentication failed, check your access credentials").Bytes()) {
-		t.Fatalf("Expected authentication error message, got %v", bodyContent)
+		t.Fatalf("Expected authentication error message, got %s", string(bodyContent))
 	}
 
 	// Unauthenticated download should fail.
@@ -1025,7 +1025,7 @@ func testDownloadWebHandler(obj ObjectLayer, instanceType string, t TestErrHandl
 	if err := obj.SetBucketPolicy(context.Background(), bucketName, bucketPolicy); err != nil {
 		t.Fatalf("unexpected error. %v", err)
 	}
-	globalPolicySys.Set(bucketName, *bucketPolicy)
+	globalPolicySys.Set(bucketName, bucketPolicy)
 	defer globalPolicySys.Remove(bucketName)
 
 	// Unauthenticated download with READ policy should succeed.
@@ -1476,8 +1476,11 @@ func testWebSetBucketPolicyHandler(obj ObjectLayer, instanceType string, t TestE
 
 // TestWebCheckAuthorization - Test Authorization for all web handlers
 func TestWebCheckAuthorization(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Prepare XL backend
-	obj, fsDirs, err := prepareXL16()
+	obj, fsDirs, err := prepareXL16(ctx)
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for XL setup: %s", err)
 	}
@@ -1565,8 +1568,11 @@ func TestWebCheckAuthorization(t *testing.T) {
 
 // TestWebObjectLayerFaultyDisks - Test Web RPC responses with faulty disks
 func TestWebObjectLayerFaultyDisks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Prepare XL backend
-	obj, fsDirs, err := prepareXL16()
+	obj, fsDirs, err := prepareXL16(ctx)
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for XL setup: %s", err)
 	}
@@ -1590,12 +1596,14 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 	z := obj.(*xlZones)
 	xl := z.zones[0].sets[0]
 	xlDisks := xl.getDisks()
+	z.zones[0].xlDisksMu.Lock()
 	xl.getDisks = func() []StorageAPI {
 		for i, d := range xlDisks {
 			xlDisks[i] = newNaughtyDisk(d, nil, errFaultyDisk)
 		}
 		return xlDisks
 	}
+	z.zones[0].xlDisksMu.Unlock()
 
 	// Initialize web rpc endpoint.
 	apiRouter := initTestWebRPCEndPoint(obj)

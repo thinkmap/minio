@@ -21,17 +21,21 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"google.golang.org/api/googleapi"
 
 	minio "github.com/minio/minio-go/v6"
+	"github.com/minio/minio-go/v6/pkg/tags"
 	"github.com/minio/minio/cmd/config/etcd/dns"
 	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/bucket/lifecycle"
+	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
+	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/hash"
 )
@@ -90,9 +94,12 @@ const (
 	ErrMissingContentLength
 	ErrMissingContentMD5
 	ErrMissingRequestBodyError
+	ErrMissingSecurityHeader
 	ErrNoSuchBucket
 	ErrNoSuchBucketPolicy
 	ErrNoSuchBucketLifecycle
+	ErrNoSuchLifecycleConfiguration
+	ErrNoSuchBucketSSEConfig
 	ErrNoSuchKey
 	ErrNoSuchUpload
 	ErrNoSuchVersion
@@ -114,7 +121,8 @@ const (
 	ErrMissingCredTag
 	ErrCredMalformed
 	ErrInvalidRegion
-	ErrInvalidService
+	ErrInvalidServiceS3
+	ErrInvalidServiceSTS
 	ErrInvalidRequestVersion
 	ErrMissingSignTag
 	ErrMissingSignHeadersTag
@@ -142,11 +150,16 @@ const (
 	ErrBadRequest
 	ErrKeyTooLongError
 	ErrInvalidBucketObjectLockConfiguration
+	ErrObjectLockConfigurationNotFound
+	ErrObjectLockConfigurationNotAllowed
+	ErrNoSuchObjectLockConfiguration
 	ErrObjectLocked
 	ErrInvalidRetentionDate
 	ErrPastObjectLockRetainDate
 	ErrUnknownWORMModeDirective
+	ErrBucketTaggingNotFound
 	ErrObjectLockInvalidHeaders
+	ErrInvalidTagDirective
 	// Add new error codes here.
 
 	// SSE-S3 related API errors
@@ -199,6 +212,7 @@ const (
 	ErrInvalidResourceName
 	ErrServerNotInitialized
 	ErrOperationTimedOut
+	ErrOperationMaxedOut
 	ErrInvalidRequest
 	// MinIO storage class error codes
 	ErrInvalidStorageClass
@@ -222,6 +236,10 @@ const (
 	ErrAdminCredentialsMismatch
 	ErrInsecureClientRequest
 	ErrObjectTampered
+	// Bucket Quota error codes
+	ErrAdminBucketQuotaExceeded
+	ErrAdminNoSuchQuotaConfiguration
+	ErrAdminBucketQuotaDisabled
 
 	ErrHealNotImplemented
 	ErrHealNoSuchProcess
@@ -321,17 +339,26 @@ const (
 	ErrAdminProfilerNotEnabled
 	ErrInvalidDecompressedSize
 	ErrAddUserInvalidArgument
+	ErrAdminAccountNotEligible
+	ErrServiceAccountNotFound
 	ErrPostPolicyConditionInvalidFormat
 )
 
 type errorCodeMap map[APIErrorCode]APIError
 
-func (e errorCodeMap) ToAPIErr(errCode APIErrorCode) APIError {
+func (e errorCodeMap) ToAPIErrWithErr(errCode APIErrorCode, err error) APIError {
 	apiErr, ok := e[errCode]
 	if !ok {
-		return e[ErrInternalError]
+		apiErr = e[ErrInternalError]
+	}
+	if err != nil {
+		apiErr.Description = fmt.Sprintf("%s (%s)", apiErr.Description, err)
 	}
 	return apiErr
+}
+
+func (e errorCodeMap) ToAPIErr(errCode APIErrorCode) APIError {
+	return e.ToAPIErrWithErr(errCode, nil)
 }
 
 // error code to APIError structure, these fields carry respective
@@ -462,6 +489,11 @@ var errorCodes = errorCodeMap{
 		Description:    "Missing required header for this request: Content-Md5.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrMissingSecurityHeader: {
+		Code:           "MissingSecurityHeader",
+		Description:    "Your request was missing a required header",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrMissingRequestBodyError: {
 		Code:           "MissingRequestBodyError",
 		Description:    "Request body is empty.",
@@ -480,6 +512,16 @@ var errorCodes = errorCodeMap{
 	ErrNoSuchBucketLifecycle: {
 		Code:           "NoSuchBucketLifecycle",
 		Description:    "The bucket lifecycle configuration does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchLifecycleConfiguration: {
+		Code:           "NoSuchLifecycleConfiguration",
+		Description:    "The lifecycle configuration does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchBucketSSEConfig: {
+		Code:           "ServerSideEncryptionConfigurationNotFoundError",
+		Description:    "The server side encryption configuration was not found",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrNoSuchKey: {
@@ -626,9 +668,14 @@ var errorCodes = errorCodeMap{
 	// FIXME: Should contain the invalid param set as seen in https://github.com/minio/minio/issues/2385.
 	// right Description:   "Error parsing the X-Amz-Credential parameter; incorrect service \"s4\". This endpoint belongs to \"s3\".".
 	// Need changes to make sure variable messages can be constructed.
-	ErrInvalidService: {
-		Code:           "AuthorizationQueryParametersError",
-		Description:    "Error parsing the X-Amz-Credential parameter; incorrect service. This endpoint belongs to \"s3\".",
+	ErrInvalidServiceS3: {
+		Code:           "AuthorizationParametersError",
+		Description:    "Error parsing the Credential/X-Amz-Credential parameter; incorrect service. This endpoint belongs to \"s3\".",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidServiceSTS: {
+		Code:           "AuthorizationParametersError",
+		Description:    "Error parsing the Credential parameter; incorrect service. This endpoint belongs to \"sts\".",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	// FIXME: Should contain the invalid param set as seen in https://github.com/minio/minio/issues/2385.
@@ -731,6 +778,26 @@ var errorCodes = errorCodeMap{
 		Description:    "Bucket is missing ObjectLockConfiguration",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrBucketTaggingNotFound: {
+		Code:           "NoSuchTagSet",
+		Description:    "The TagSet does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrObjectLockConfigurationNotFound: {
+		Code:           "ObjectLockConfigurationNotFoundError",
+		Description:    "Object Lock configuration does not exist for this bucket",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrObjectLockConfigurationNotAllowed: {
+		Code:           "InvalidBucketState",
+		Description:    "Object Lock configuration cannot be enabled on existing buckets",
+		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrNoSuchObjectLockConfiguration: {
+		Code:           "NoSuchObjectLockConfiguration",
+		Description:    "The specified object does not have a ObjectLock configuration",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrObjectLocked: {
 		Code:           "InvalidRequest",
 		Description:    "Object is WORM protected and cannot be overwritten",
@@ -820,6 +887,11 @@ var errorCodes = errorCodeMap{
 	ErrMetadataTooLarge: {
 		Code:           "InvalidArgument",
 		Description:    "Your metadata headers exceed the maximum allowed metadata size.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidTagDirective: {
+		Code:           "InvalidArgument",
+		Description:    "Unknown tag directive.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidEncryptionMethod: {
@@ -1027,6 +1099,21 @@ var errorCodes = errorCodeMap{
 		Description:    "Credentials in config mismatch with server environment variables",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
+	ErrAdminBucketQuotaExceeded: {
+		Code:           "XMinioAdminBucketQuotaExceeded",
+		Description:    "Bucket quota exceeded",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAdminNoSuchQuotaConfiguration: {
+		Code:           "XMinioAdminNoSuchQuotaConfiguration",
+		Description:    "The quota configuration does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrAdminBucketQuotaDisabled: {
+		Code:           "XMinioAdminBucketQuotaDisabled",
+		Description:    "Quota specified but disk usage crawl is disabled on MinIO server",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrInsecureClientRequest: {
 		Code:           "XMinioInsecureClientRequest",
 		Description:    "Cannot respond to plain-text request from TLS-encrypted server",
@@ -1035,6 +1122,11 @@ var errorCodes = errorCodeMap{
 	ErrOperationTimedOut: {
 		Code:           "XMinioServerTimedOut",
 		Description:    "A timeout occurred while trying to lock a resource",
+		HTTPStatusCode: http.StatusRequestTimeout,
+	},
+	ErrOperationMaxedOut: {
+		Code:           "XMinioServerTimedOut",
+		Description:    "A timeout exceeded while waiting to proceed with the request",
 		HTTPStatusCode: http.StatusRequestTimeout,
 	},
 	ErrUnsupportedMetadata: {
@@ -1532,6 +1624,16 @@ var errorCodes = errorCodeMap{
 		Description:    "User is not allowed to be same as admin access key",
 		HTTPStatusCode: http.StatusConflict,
 	},
+	ErrAdminAccountNotEligible: {
+		Code:           "XMinioInvalidIAMCredentials",
+		Description:    "The administrator key is not eligible for this operation",
+		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrServiceAccountNotFound: {
+		Code:           "XMinioInvalidIAMCredentials",
+		Description:    "The specified service account is not found",
+		HTTPStatusCode: http.StatusNotFound,
+	},
 	ErrPostPolicyConditionInvalidFormat: {
 		Code:           "PostPolicyInvalidKeyName",
 		Description:    "Invalid according to Policy: Policy Condition failed",
@@ -1600,18 +1702,20 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrKMSNotConfigured
 	case crypto.ErrKMSAuthLogin:
 		apiErr = ErrKMSAuthFailure
-	case errOperationTimedOut, context.Canceled, context.DeadlineExceeded:
+	case context.Canceled, context.DeadlineExceeded:
 		apiErr = ErrOperationTimedOut
 	case errDiskNotFound:
 		apiErr = ErrSlowDown
-	case errInvalidRetentionDate:
+	case objectlock.ErrInvalidRetentionDate:
 		apiErr = ErrInvalidRetentionDate
-	case errPastObjectLockRetainDate:
+	case objectlock.ErrPastObjectLockRetainDate:
 		apiErr = ErrPastObjectLockRetainDate
-	case errUnknownWORMModeDirective:
+	case objectlock.ErrUnknownWORMModeDirective:
 		apiErr = ErrUnknownWORMModeDirective
-	case errObjectLockInvalidHeaders:
+	case objectlock.ErrObjectLockInvalidHeaders:
 		apiErr = ErrObjectLockInvalidHeaders
+	case objectlock.ErrMalformedXML:
+		apiErr = ErrMalformedXML
 	}
 
 	// Compression errors
@@ -1701,7 +1805,13 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	case BucketPolicyNotFound:
 		apiErr = ErrNoSuchBucketPolicy
 	case BucketLifecycleNotFound:
-		apiErr = ErrNoSuchBucketLifecycle
+		apiErr = ErrNoSuchLifecycleConfiguration
+	case BucketSSEConfigNotFound:
+		apiErr = ErrNoSuchBucketSSEConfig
+	case BucketQuotaConfigNotFound:
+		apiErr = ErrAdminNoSuchQuotaConfiguration
+	case BucketQuotaExceeded:
+		apiErr = ErrAdminBucketQuotaExceeded
 	case *event.ErrInvalidEventName:
 		apiErr = ErrEventNotification
 	case *event.ErrInvalidARN:
@@ -1724,10 +1834,10 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrOverlappingFilterNotification
 	case *event.ErrUnsupportedConfiguration:
 		apiErr = ErrUnsupportedNotification
+	case OperationTimedOut:
+		apiErr = ErrOperationTimedOut
 	case BackendDown:
 		apiErr = ErrBackendDown
-	case crypto.Error:
-		apiErr = ErrObjectTampered
 	case ObjectNameTooLong:
 		apiErr = ErrKeyTooLongError
 	default:
@@ -1772,9 +1882,41 @@ func toAPIError(ctx context.Context, err error) APIError {
 		// their internal error types. This code is only
 		// useful with gateway implementations.
 		switch e := err.(type) {
+		case *xml.SyntaxError:
+			apiErr = APIError{
+				Code: "MalformedXML",
+				Description: fmt.Sprintf("%s (%s)", errorCodes[ErrMalformedXML].Description,
+					e.Error()),
+				HTTPStatusCode: errorCodes[ErrMalformedXML].HTTPStatusCode,
+			}
+		case url.EscapeError:
+			apiErr = APIError{
+				Code: "XMinioInvalidObjectName",
+				Description: fmt.Sprintf("%s (%s)", errorCodes[ErrInvalidObjectName].Description,
+					e.Error()),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case lifecycle.Error:
+			apiErr = APIError{
+				Code:           "InvalidRequest",
+				Description:    e.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case tags.Error:
+			apiErr = APIError{
+				Code:           e.Code(),
+				Description:    e.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case policy.Error:
+			apiErr = APIError{
+				Code:           "MalformedPolicy",
+				Description:    e.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
 		case crypto.Error:
 			apiErr = APIError{
-				Code:           "XKMSInternalError",
+				Code:           "XMinIOEncryptionError",
 				Description:    e.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
@@ -1801,12 +1943,6 @@ func toAPIError(ctx context.Context, err error) APIError {
 				Code:           string(e.ServiceCode()),
 				Description:    e.Error(),
 				HTTPStatusCode: e.Response().StatusCode,
-			}
-		case oss.ServiceError:
-			apiErr = APIError{
-				Code:           e.Code,
-				Description:    e.Message,
-				HTTPStatusCode: e.StatusCode,
 			}
 			// Add more Gateway SDKs here if any in future.
 		}

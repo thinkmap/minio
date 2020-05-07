@@ -1,5 +1,5 @@
 # MinIO Quickstart Guide
-[![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Go Report Card](https://goreportcard.com/badge/minio/minio)](https://goreportcard.com/report/minio/minio) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
+[![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
 
 [![MinIO](https://raw.githubusercontent.com/minio/minio/master/.github/logo.svg?sanitize=true)](https://min.io)
 
@@ -21,7 +21,7 @@ docker run -p 9000:9000 minio/minio:edge server /data
 > NOTE: Docker will not display the default keys unless you start the container with the `-it`(interactive TTY) argument. Generally, it is not recommended to use default keys with containers. Please visit MinIO Docker quickstart guide for more information [here](https://docs.min.io/docs/minio-docker-quickstart-guide)
 
 ## macOS
-### Homebrew
+### Homebrew (recommended)
 Install minio packages using [Homebrew](http://brew.sh/)
 ```sh
 brew install minio/stable/minio
@@ -74,7 +74,7 @@ minio.exe server D:\Photos
 
 ## FreeBSD
 ### Port
-Install minio packages using [pkg](https://github.com/freebsd/pkg)
+Install minio packages using [pkg](https://github.com/freebsd/pkg), MinIO doesn't officially build FreeBSD binaries but is maintained by FreeBSD upstream [here](https://www.freshports.org/www/minio).
 
 ```sh
 pkg install minio
@@ -184,12 +184,6 @@ mc admin update <minio alias, e.g., myminio>
 
 ## Contribute to MinIO Project
 Please follow MinIO [Contributor's Guide](https://github.com/minio/minio/blob/master/CONTRIBUTING.md)
-
-## Caveats
-MinIO in its default mode doesn't use MD5Sum checkums of incoming streams unless requested by the client in `Content-Md5` header for validation. This may lead to incompatibility with rare S3 clients like `s3ql` which unfortunately do not set `Content-Md5` but depend on hex MD5Sum for the stream to be calculated by the server. MinIO considers this as a bug in `s3ql` and should be fixed on the client side because MD5Sum is a poor way to checksum and validate the authenticity of the objects. Although MinIO provides a workaround until client applications are fixed use `--compat` option instead to start the server.
-```sh
-./minio --compat server /data
-```
 
 ## License
 [![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2Fminio%2Fminio.svg?type=large)](https://app.fossa.io/projects/git%2Bgithub.com%2Fminio%2Fminio?ref=badge_large)

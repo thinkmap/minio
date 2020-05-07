@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2015-2019 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,17 +22,19 @@ import (
 	"sort"
 
 	"github.com/minio/cli"
-	"github.com/minio/mc/pkg/console"
+	"github.com/minio/minio/pkg/console"
 	"github.com/minio/minio/pkg/trie"
 	"github.com/minio/minio/pkg/words"
 )
 
 // GlobalFlags - global flags for minio.
 var GlobalFlags = []cli.Flag{
+	// Deprecated flag, so its hidden now - existing deployments will keep working.
 	cli.StringFlag{
-		Name:  "config-dir, C",
-		Value: defaultConfigDir.Get(),
-		Usage: "[DEPRECATED] path to legacy configuration directory",
+		Name:   "config-dir, C",
+		Value:  defaultConfigDir.Get(),
+		Usage:  "[DEPRECATED] path to legacy configuration directory",
+		Hidden: true,
 	},
 	cli.StringFlag{
 		Name:  "certs-dir, S",
@@ -51,9 +53,17 @@ var GlobalFlags = []cli.Flag{
 		Name:  "json",
 		Usage: "output server logs and startup information in json format",
 	},
+	// Deprecated flag, so its hidden now, existing deployments will keep working.
 	cli.BoolFlag{
-		Name:  "compat",
-		Usage: "enable strict S3 compatibility by turning off certain performance optimizations",
+		Name:   "compat",
+		Usage:  "enable strict S3 compatibility by turning off certain performance optimizations",
+		Hidden: true,
+	},
+	// This flag is hidden and to be used only during certain performance testing.
+	cli.BoolFlag{
+		Name:   "no-compat",
+		Usage:  "disable strict S3 compatibility by turning on certain performance optimizations",
+		Hidden: true,
 	},
 }
 
@@ -74,8 +84,8 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
 VERSION:
-  ` + Version +
-	`{{ "\n"}}`
+  {{.Version}}
+`
 
 func newApp(name string) *cli.App {
 	// Collection of minio commands currently supported are.
@@ -126,11 +136,10 @@ func newApp(name string) *cli.App {
 	app := cli.NewApp()
 	app.Name = name
 	app.Author = "MinIO, Inc."
-	app.Version = Version
+	app.Version = ReleaseTag
 	app.Usage = "High Performance Object Storage"
 	app.Description = `Build high performance data infrastructure for machine learning, analytics and application data workloads with MinIO`
 	app.Flags = GlobalFlags
-	app.HideVersion = true     // Hide `--version` flag, we already have `minio version`.
 	app.HideHelpCommand = true // Hide `help, h` command, we already have `minio --help`.
 	app.Commands = commands
 	app.CustomAppHelpTemplate = minioHelpTemplate

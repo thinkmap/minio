@@ -17,6 +17,8 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -104,6 +106,8 @@ func toObjectErr(err error, params ...string) error {
 	case errXLWriteQuorum:
 		err = InsufficientWriteQuorum{}
 	case io.ErrUnexpectedEOF, io.ErrShortWrite:
+		err = IncompleteBody{}
+	case context.Canceled, context.DeadlineExceeded:
 		err = IncompleteBody{}
 	}
 	return err
@@ -261,12 +265,33 @@ func (e BucketLifecycleNotFound) Error() string {
 	return "No bucket life cycle found for bucket : " + e.Bucket
 }
 
+// BucketSSEConfigNotFound - no bucket encryption config found
+type BucketSSEConfigNotFound GenericError
+
+func (e BucketSSEConfigNotFound) Error() string {
+	return "No bucket encryption found for bucket: " + e.Bucket
+}
+
+// BucketQuotaConfigNotFound - no bucket quota config found.
+type BucketQuotaConfigNotFound GenericError
+
+func (e BucketQuotaConfigNotFound) Error() string {
+	return "No quota config found for bucket : " + e.Bucket
+}
+
+// BucketQuotaExceeded - bucket quota exceeded.
+type BucketQuotaExceeded GenericError
+
+func (e BucketQuotaExceeded) Error() string {
+	return "Bucket quota exceeded for bucket: " + e.Bucket
+}
+
 /// Bucket related errors.
 
 // BucketNameInvalid - bucketname provided is invalid.
 type BucketNameInvalid GenericError
 
-// Return string an error formatted as the given text.
+// Error returns string an error formatted as the given text.
 func (e BucketNameInvalid) Error() string {
 	return "Bucket name invalid: " + e.Bucket
 }
@@ -282,17 +307,17 @@ type ObjectNameTooLong GenericError
 // ObjectNamePrefixAsSlash - object name has a slash as prefix.
 type ObjectNamePrefixAsSlash GenericError
 
-// Return string an error formatted as the given text.
+// Error returns string an error formatted as the given text.
 func (e ObjectNameInvalid) Error() string {
 	return "Object name invalid: " + e.Bucket + "#" + e.Object
 }
 
-// Return string an error formatted as the given text.
+// Error returns string an error formatted as the given text.
 func (e ObjectNameTooLong) Error() string {
 	return "Object name too long: " + e.Bucket + "#" + e.Object
 }
 
-// Return string an error formatted as the given text.
+// Error returns string an error formatted as the given text.
 func (e ObjectNamePrefixAsSlash) Error() string {
 	return "Object name contains forward slash as pefix: " + e.Bucket + "#" + e.Object
 }
@@ -300,7 +325,7 @@ func (e ObjectNamePrefixAsSlash) Error() string {
 // AllAccessDisabled All access to this object has been disabled
 type AllAccessDisabled GenericError
 
-// Return string an error formatted as the given text.
+// Error returns string an error formatted as the given text.
 func (e AllAccessDisabled) Error() string {
 	return "All access to this object has been disabled"
 }
@@ -308,7 +333,7 @@ func (e AllAccessDisabled) Error() string {
 // IncompleteBody You did not provide the number of bytes specified by the Content-Length HTTP header.
 type IncompleteBody GenericError
 
-// Return string an error formatted as the given text.
+// Error returns string an error formatted as the given text.
 func (e IncompleteBody) Error() string {
 	return e.Bucket + "#" + e.Object + "has incomplete body"
 }
@@ -340,11 +365,10 @@ func (e ObjectTooSmall) Error() string {
 
 // OperationTimedOut - a timeout occurred.
 type OperationTimedOut struct {
-	Path string
 }
 
 func (e OperationTimedOut) Error() string {
-	return "Operation timed out: " + e.Path
+	return "Operation timed out"
 }
 
 /// Multipart related errors.
@@ -429,14 +453,14 @@ func (e BackendDown) Error() string {
 
 // isErrBucketNotFound - Check if error type is BucketNotFound.
 func isErrBucketNotFound(err error) bool {
-	_, ok := err.(BucketNotFound)
-	return ok
+	var bkNotFound BucketNotFound
+	return errors.As(err, &bkNotFound)
 }
 
 // isErrObjectNotFound - Check if error type is ObjectNotFound.
 func isErrObjectNotFound(err error) bool {
-	_, ok := err.(ObjectNotFound)
-	return ok
+	var objNotFound ObjectNotFound
+	return errors.As(err, &objNotFound)
 }
 
 // PreConditionFailed - Check if copy precondition failed

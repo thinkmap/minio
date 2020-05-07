@@ -101,7 +101,7 @@ func TestFixFormatV3(t *testing.T) {
 		formats[j] = newFormat
 	}
 
-	if err = initFormatXLMetaVolume(storageDisks, formats); err != nil {
+	if err = initXLMetaVolumesInLocalDisks(storageDisks, formats); err != nil {
 		t.Fatal(err)
 	}
 
@@ -112,7 +112,7 @@ func TestFixFormatV3(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newFormats, errs := loadFormatXLAll(storageDisks)
+	newFormats, errs := loadFormatXLAll(storageDisks, false)
 	for _, err := range errs {
 		if err != nil && err != errUnformattedDisk {
 			t.Fatal(err)

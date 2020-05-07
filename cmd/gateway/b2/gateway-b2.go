@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2017, 2018 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2017-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,9 +33,9 @@ import (
 	miniogopolicy "github.com/minio/minio-go/v6/pkg/policy"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
 	h2 "github.com/minio/minio/pkg/hash"
-	"github.com/minio/minio/pkg/policy"
-	"github.com/minio/minio/pkg/policy/condition"
 
 	minio "github.com/minio/minio/cmd"
 )
@@ -69,8 +69,11 @@ EXAMPLES:
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_SECRET_KEY{{.AssignmentOperator}}applicationKey
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_DRIVES{{.AssignmentOperator}}"/mnt/drive1,/mnt/drive2,/mnt/drive3,/mnt/drive4"
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_EXCLUDE{{.AssignmentOperator}}"bucket1/*,*.png"
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_EXPIRY{{.AssignmentOperator}}40
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_QUOTA{{.AssignmentOperator}}80
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_QUOTA{{.AssignmentOperator}}90
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_AFTER{{.AssignmentOperator}}3
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_WATERMARK_LOW{{.AssignmentOperator}}75
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_WATERMARK_HIGH{{.AssignmentOperator}}85
+
      {{.Prompt}} {{.HelpName}}
 `
 	minio.RegisterGatewayCommand(cli.Command{
@@ -84,11 +87,20 @@ EXAMPLES:
 
 // Handler for 'minio gateway b2' command line.
 func b2GatewayMain(ctx *cli.Context) {
-	minio.StartGateway(ctx, &B2{})
+	strictS3Compat := true
+	if ctx.IsSet("no-compat") || ctx.GlobalIsSet("no-compat") {
+		strictS3Compat = false
+	}
+
+	minio.StartGateway(ctx, &B2{
+		strictS3Compat: strictS3Compat,
+	})
 }
 
 // B2 implements MinIO Gateway
-type B2 struct{}
+type B2 struct {
+	strictS3Compat bool
+}
 
 // Name implements Gateway interface.
 func (g *B2) Name() string {
@@ -98,8 +110,8 @@ func (g *B2) Name() string {
 // NewGatewayLayer returns b2 gateway layer, implements ObjectLayer interface to
 // talk to B2 remote backend.
 func (g *B2) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
-	ctx := context.Background()
-	client, err := b2.AuthorizeAccount(ctx, creds.AccessKey, creds.SecretKey, b2.Transport(minio.NewCustomHTTPTransport()))
+	ctx := minio.GlobalContext
+	client, err := b2.AuthorizeAccount(ctx, creds.AccessKey, creds.SecretKey, b2.Transport(minio.NewGatewayHTTPTransport()))
 	if err != nil {
 		return nil, err
 	}
@@ -108,9 +120,10 @@ func (g *B2) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) 
 		creds:    creds,
 		b2Client: client,
 		httpClient: &http.Client{
-			Transport: minio.NewCustomHTTPTransport(),
+			Transport: minio.NewGatewayHTTPTransport(),
 		},
-		ctx: ctx,
+		ctx:            ctx,
+		strictS3Compat: g.strictS3Compat,
 	}, nil
 }
 
@@ -122,11 +135,13 @@ func (g *B2) Production() bool {
 // b2Object implements gateway for MinIO and BackBlaze B2 compatible object storage servers.
 type b2Objects struct {
 	minio.GatewayUnsupported
-	mu         sync.Mutex
-	creds      auth.Credentials
-	b2Client   *b2.B2
-	httpClient *http.Client
-	ctx        context.Context
+	mu             sync.Mutex
+	creds          auth.Credentials
+	b2Client       *b2.B2
+	httpClient     *http.Client
+	ctx            context.Context
+	buckets        []*b2.Bucket
+	strictS3Compat bool
 }
 
 // Convert B2 errors to minio object layer errors.
@@ -217,7 +232,7 @@ func (l *b2Objects) Shutdown(ctx context.Context) error {
 }
 
 // StorageInfo is not relevant to B2 backend.
-func (l *b2Objects) StorageInfo(ctx context.Context) (si minio.StorageInfo) {
+func (l *b2Objects) StorageInfo(ctx context.Context, _ bool) (si minio.StorageInfo) {
 	si.Backend.Type = minio.BackendGateway
 	si.Backend.GatewayOnline = minio.IsBackendOnline(ctx, l.httpClient, "https://api.backblazeb2.com/b2api/v1")
 	return si
@@ -234,7 +249,7 @@ func (l *b2Objects) MakeBucketWithLocation(ctx context.Context, bucket, location
 }
 
 func (l *b2Objects) reAuthorizeAccount(ctx context.Context) error {
-	client, err := b2.AuthorizeAccount(l.ctx, l.creds.AccessKey, l.creds.SecretKey, b2.Transport(minio.NewCustomHTTPTransport()))
+	client, err := b2.AuthorizeAccount(l.ctx, l.creds.AccessKey, l.creds.SecretKey, b2.Transport(minio.NewGatewayHTTPTransport()))
 	if err != nil {
 		return err
 	}
@@ -242,6 +257,15 @@ func (l *b2Objects) reAuthorizeAccount(ctx context.Context) error {
 	l.b2Client.Update(client)
 	l.mu.Unlock()
 	return nil
+}
+
+// getETag returns an S3-compatible md5sum-ETag if requested and possible.
+func (l *b2Objects) getETag(f *b2.File, fi *b2.FileInfo) string {
+	if l.strictS3Compat && fi.MD5 != "" {
+		return fi.MD5
+	}
+
+	return minio.ToS3ETag(f.ID)
 }
 
 // listBuckets is a wrapper similar to ListBuckets, which re-authorizes
@@ -257,11 +281,14 @@ func (l *b2Objects) listBuckets(ctx context.Context, err error) ([]*b2.Bucket, e
 			return nil, rerr
 		}
 	}
-	bktList, lerr := l.b2Client.ListBuckets(l.ctx)
-	if lerr != nil {
-		return l.listBuckets(ctx, lerr)
+	if len(l.buckets) == 0 {
+		bktList, lerr := l.b2Client.ListBuckets(l.ctx)
+		if lerr != nil {
+			return l.listBuckets(ctx, lerr)
+		}
+		l.buckets = bktList
 	}
-	return bktList, nil
+	return l.buckets, nil
 }
 
 // Bucket - is a helper which provides a *Bucket instance
@@ -310,12 +337,26 @@ func (l *b2Objects) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error)
 }
 
 // DeleteBucket deletes a bucket on B2
-func (l *b2Objects) DeleteBucket(ctx context.Context, bucket string) error {
+func (l *b2Objects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
 	bkt, err := l.Bucket(ctx, bucket)
 	if err != nil {
 		return err
 	}
 	err = bkt.DeleteBucket(l.ctx)
+	if err != nil {
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return err
+		}
+
+		err = bkt.DeleteBucket(l.ctx)
+
+		logger.LogIf(ctx, err)
+		return b2ToObjectError(err, bucket)
+	}
+
 	logger.LogIf(ctx, err)
 	return b2ToObjectError(err, bucket)
 }
@@ -328,8 +369,18 @@ func (l *b2Objects) ListObjects(ctx context.Context, bucket string, prefix strin
 	}
 	files, next, lerr := bkt.ListFileNames(l.ctx, maxKeys, marker, prefix, delimiter)
 	if lerr != nil {
-		logger.LogIf(ctx, lerr)
-		return loi, b2ToObjectError(lerr, bucket)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return loi, err
+		}
+
+		files, next, lerr = bkt.ListFileNames(l.ctx, maxKeys, marker, prefix, delimiter)
+		if lerr != nil {
+			logger.LogIf(ctx, lerr)
+			return loi, b2ToObjectError(lerr, bucket)
+		}
 	}
 	loi.IsTruncated = next != ""
 	loi.NextMarker = next
@@ -343,7 +394,7 @@ func (l *b2Objects) ListObjects(ctx context.Context, bucket string, prefix strin
 				Name:        file.Name,
 				ModTime:     file.Timestamp,
 				Size:        file.Size,
-				ETag:        minio.ToS3ETag(file.ID),
+				ETag:        l.getETag(file, file.Info),
 				ContentType: file.Info.ContentType,
 				UserDefined: file.Info.Info,
 			})
@@ -370,8 +421,18 @@ func (l *b2Objects) ListObjectsV2(ctx context.Context, bucket, prefix, continuat
 	}
 	files, next, lerr := bkt.ListFileNames(l.ctx, maxKeys, marker, prefix, delimiter)
 	if lerr != nil {
-		logger.LogIf(ctx, lerr)
-		return loi, b2ToObjectError(lerr, bucket)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return loi, err
+		}
+
+		files, next, lerr = bkt.ListFileNames(l.ctx, maxKeys, marker, prefix, delimiter)
+		if lerr != nil {
+			logger.LogIf(ctx, lerr)
+			return loi, b2ToObjectError(lerr, bucket)
+		}
 	}
 	loi.IsTruncated = next != ""
 	loi.ContinuationToken = continuationToken
@@ -386,7 +447,7 @@ func (l *b2Objects) ListObjectsV2(ctx context.Context, bucket, prefix, continuat
 				Name:        file.Name,
 				ModTime:     file.Timestamp,
 				Size:        file.Size,
-				ETag:        minio.ToS3ETag(file.ID),
+				ETag:        l.getETag(file, file.Info),
 				ContentType: file.Info.ContentType,
 				UserDefined: file.Info.Info,
 			})
@@ -411,13 +472,13 @@ func (l *b2Objects) GetObjectNInfo(ctx context.Context, bucket, object string, r
 
 	pr, pw := io.Pipe()
 	go func() {
-		err := l.GetObject(ctx, bucket, object, startOffset, length, pw, objInfo.ETag, opts)
+		err := l.GetObject(ctx, bucket, object, startOffset, length, pw, "", opts)
 		pw.CloseWithError(err)
 	}()
 	// Setup cleanup function to cause the above go-routine to
 	// exit in case of partial read
 	pipeCloser := func() { pr.Close() }
-	return minio.NewGetObjectReaderFromReader(pr, objInfo, opts.CheckCopyPrecondFn, pipeCloser)
+	return minio.NewGetObjectReaderFromReader(pr, objInfo, opts, pipeCloser)
 }
 
 // GetObject reads an object from B2. Supports additional
@@ -431,10 +492,20 @@ func (l *b2Objects) GetObject(ctx context.Context, bucket string, object string,
 	if err != nil {
 		return err
 	}
-	reader, err := bkt.DownloadFileByName(l.ctx, object, startOffset, length)
+	reader, err := bkt.DownloadFileByName(l.ctx, object, startOffset, length, false)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return b2ToObjectError(err, bucket, object)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return err
+		}
+
+		reader, err = bkt.DownloadFileByName(l.ctx, object, startOffset, length, false)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return b2ToObjectError(err, bucket, object)
+		}
 	}
 	defer reader.Close()
 	_, err = io.Copy(writer, reader)
@@ -451,8 +522,18 @@ func (l *b2Objects) GetObjectInfo(ctx context.Context, bucket string, object str
 
 	f, _, err := bkt.ListFileNames(l.ctx, 1, object, "", "")
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return objInfo, b2ToObjectError(err, bucket, object)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return objInfo, err
+		}
+
+		f, _, err = bkt.ListFileNames(l.ctx, 1, object, "", "")
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return objInfo, b2ToObjectError(err, bucket, object)
+		}
 	}
 
 	// B2's list will return the next item in the bucket if the object doesn't
@@ -466,13 +547,23 @@ func (l *b2Objects) GetObjectInfo(ctx context.Context, bucket string, object str
 
 	fi, err := bkt.File(f[0].ID, object).GetFileInfo(l.ctx)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return objInfo, b2ToObjectError(err, bucket, object)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return objInfo, err
+		}
+
+		fi, err = bkt.File(f[0].ID, object).GetFileInfo(l.ctx)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return objInfo, b2ToObjectError(err, bucket, object)
+		}
 	}
 	return minio.ObjectInfo{
 		Bucket:      bucket,
 		Name:        object,
-		ETag:        minio.ToS3ETag(f[0].ID),
+		ETag:        l.getETag(f[0], fi),
 		Size:        fi.Size,
 		ModTime:     fi.Timestamp,
 		ContentType: fi.ContentType,
@@ -557,8 +648,18 @@ func (l *b2Objects) PutObject(ctx context.Context, bucket string, object string,
 	var u *b2.URL
 	u, err = bkt.GetUploadURL(l.ctx)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return objInfo, b2ToObjectError(err, bucket, object)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return objInfo, err
+		}
+
+		u, err = bkt.GetUploadURL(l.ctx)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return objInfo, b2ToObjectError(err, bucket, object)
+		}
 	}
 
 	hr := newB2Reader(data, data.Size())
@@ -579,7 +680,7 @@ func (l *b2Objects) PutObject(ctx context.Context, bucket string, object string,
 	return minio.ObjectInfo{
 		Bucket:      bucket,
 		Name:        object,
-		ETag:        minio.ToS3ETag(f.ID),
+		ETag:        l.getETag(f, fi),
 		Size:        fi.Size,
 		ModTime:     fi.Timestamp,
 		ContentType: fi.ContentType,
@@ -597,6 +698,19 @@ func (l *b2Objects) DeleteObject(ctx context.Context, bucket string, object stri
 	// If we hide the file we'll conform to B2's versioning policy, it also
 	// saves an additional call to check if the file exists first
 	_, err = bkt.HideFile(l.ctx, object)
+	if err != nil {
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return err
+		}
+
+		_, err = bkt.HideFile(l.ctx, object)
+
+		logger.LogIf(ctx, err)
+		return b2ToObjectError(err, bucket, object)
+	}
 	logger.LogIf(ctx, err)
 	return b2ToObjectError(err, bucket, object)
 }
@@ -625,8 +739,18 @@ func (l *b2Objects) ListMultipartUploads(ctx context.Context, bucket string, pre
 	}
 	largeFiles, nextMarker, err := bkt.ListUnfinishedLargeFiles(l.ctx, maxUploads, uploadIDMarker)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return lmi, b2ToObjectError(err, bucket)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return lmi, err
+		}
+
+		largeFiles, nextMarker, err = bkt.ListUnfinishedLargeFiles(l.ctx, maxUploads, uploadIDMarker)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return lmi, b2ToObjectError(err, bucket)
+		}
 	}
 	lmi = minio.ListMultipartsInfo{
 		MaxUploads: maxUploads,
@@ -661,8 +785,18 @@ func (l *b2Objects) NewMultipartUpload(ctx context.Context, bucket string, objec
 	delete(opts.UserDefined, "content-type")
 	lf, err := bkt.StartLargeFile(l.ctx, object, contentType, opts.UserDefined)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return uploadID, b2ToObjectError(err, bucket, object)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return uploadID, err
+		}
+
+		lf, err = bkt.StartLargeFile(l.ctx, object, contentType, opts.UserDefined)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return uploadID, b2ToObjectError(err, bucket, object)
+		}
 	}
 
 	return lf.ID, nil
@@ -678,8 +812,18 @@ func (l *b2Objects) PutObjectPart(ctx context.Context, bucket string, object str
 
 	fc, err := bkt.File(uploadID, object).CompileParts(0, nil).GetUploadPartURL(l.ctx)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return pi, b2ToObjectError(err, bucket, object, uploadID)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return pi, err
+		}
+
+		fc, err = bkt.File(uploadID, object).CompileParts(0, nil).GetUploadPartURL(l.ctx)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return pi, b2ToObjectError(err, bucket, object, uploadID)
+		}
 	}
 
 	hr := newB2Reader(data, data.Size())
@@ -714,8 +858,18 @@ func (l *b2Objects) ListObjectParts(ctx context.Context, bucket string, object s
 	partNumberMarker++
 	partsList, next, err := bkt.File(uploadID, object).ListParts(l.ctx, partNumberMarker, maxParts)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return lpi, b2ToObjectError(err, bucket, object, uploadID)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return lpi, err
+		}
+
+		partsList, next, err = bkt.File(uploadID, object).ListParts(l.ctx, partNumberMarker, maxParts)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return lpi, b2ToObjectError(err, bucket, object, uploadID)
+		}
 	}
 	if next != 0 {
 		lpi.IsTruncated = true
@@ -738,6 +892,19 @@ func (l *b2Objects) AbortMultipartUpload(ctx context.Context, bucket string, obj
 		return err
 	}
 	err = bkt.File(uploadID, object).CompileParts(0, nil).CancelLargeFile(l.ctx)
+	if err != nil {
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return err
+		}
+
+		err = bkt.File(uploadID, object).CompileParts(0, nil).CancelLargeFile(l.ctx)
+
+		logger.LogIf(ctx, err)
+		return b2ToObjectError(err, bucket, object, uploadID)
+	}
 	logger.LogIf(ctx, err)
 	return b2ToObjectError(err, bucket, object, uploadID)
 }
@@ -762,8 +929,17 @@ func (l *b2Objects) CompleteMultipartUpload(ctx context.Context, bucket string, 
 	}
 
 	if _, err = bkt.File(uploadID, object).CompileParts(0, hashes).FinishLargeFile(l.ctx); err != nil {
-		logger.LogIf(ctx, err)
-		return oi, b2ToObjectError(err, bucket, object, uploadID)
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return oi, err
+		}
+
+		if _, err = bkt.File(uploadID, object).CompileParts(0, hashes).FinishLargeFile(l.ctx); err != nil {
+			logger.LogIf(ctx, err)
+			return oi, b2ToObjectError(err, bucket, object, uploadID)
+		}
 	}
 
 	return l.GetObjectInfo(ctx, bucket, object, minio.ObjectOptions{})
@@ -806,6 +982,20 @@ func (l *b2Objects) SetBucketPolicy(ctx context.Context, bucket string, bucketPo
 	}
 	bkt.Type = bucketTypeReadOnly
 	_, err = bkt.Update(l.ctx)
+	if err != nil {
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return err
+		}
+		bkt.Type = bucketTypeReadOnly
+
+		_, err = bkt.Update(l.ctx)
+
+		logger.LogIf(ctx, err)
+		return b2ToObjectError(err)
+	}
 	logger.LogIf(ctx, err)
 	return b2ToObjectError(err)
 }
@@ -854,6 +1044,20 @@ func (l *b2Objects) DeleteBucketPolicy(ctx context.Context, bucket string) error
 	}
 	bkt.Type = bucketTypePrivate
 	_, err = bkt.Update(l.ctx)
+	if err != nil {
+		l.buckets = []*b2.Bucket{}
+
+		bkt, err := l.Bucket(ctx, bucket)
+		if err != nil {
+			return err
+		}
+		bkt.Type = bucketTypePrivate
+
+		_, err = bkt.Update(l.ctx)
+
+		logger.LogIf(ctx, err)
+		return b2ToObjectError(err)
+	}
 	logger.LogIf(ctx, err)
 	return b2ToObjectError(err)
 }
@@ -861,4 +1065,9 @@ func (l *b2Objects) DeleteBucketPolicy(ctx context.Context, bucket string) error
 // IsCompressionSupported returns whether compression is applicable for this layer.
 func (l *b2Objects) IsCompressionSupported() bool {
 	return false
+}
+
+// IsReady returns whether the layer is ready to take requests.
+func (l *b2Objects) IsReady(ctx context.Context) bool {
+	return minio.IsBackendOnline(ctx, l.httpClient, "https://api.backblazeb2.com/b2api/v1")
 }

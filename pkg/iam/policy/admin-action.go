@@ -17,9 +17,7 @@
 package iampolicy
 
 import (
-	"fmt"
-
-	"github.com/minio/minio/pkg/policy/condition"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
 )
 
 // AdminAction - admin policy action.
@@ -31,8 +29,26 @@ const (
 
 	// Service Actions
 
-	// ListServerInfoAdminAction - allow listing server info
-	ListServerInfoAdminAction = "admin:ListServerInfo"
+	// StorageInfoAdminAction - allow listing server info
+	StorageInfoAdminAction = "admin:StorageInfo"
+	// AccountingUsageInfoAdminAction - allow listing accounting usage info
+	AccountingUsageInfoAdminAction = "admin:AccountingUsageInfo"
+	// DataUsageInfoAdminAction - allow listing data usage info
+	DataUsageInfoAdminAction = "admin:DataUsageInfo"
+	// TopLocksAdminAction - allow listing top locks
+	TopLocksAdminAction = "admin:TopLocksInfo"
+	// ProfilingAdminAction - allow profiling
+	ProfilingAdminAction = "admin:Profiling"
+	// TraceAdminAction - allow listing server trace
+	TraceAdminAction = "admin:ServerTrace"
+	// ConsoleLogAdminAction - allow listing console logs on terminal
+	ConsoleLogAdminAction = "admin:ConsoleLog"
+	// KMSKeyStatusAdminAction - allow getting KMS key status
+	KMSKeyStatusAdminAction = "admin:KMSKeyStatus"
+	// ServerInfoAdminAction - allow listing server info
+	ServerInfoAdminAction = "admin:ServerInfo"
+	// OBDInfoAdminAction - allow obtaining cluster on-board diagnostics
+	OBDInfoAdminAction = "admin:OBDInfo"
 
 	// ServerUpdateAdminAction - allow MinIO binary update
 	ServerUpdateAdminAction = "admin:ServerUpdate"
@@ -46,6 +62,7 @@ const (
 
 	// CreateUserAdminAction - allow creating MinIO user
 	CreateUserAdminAction = "admin:CreateUser"
+
 	// DeleteUserAdminAction - allow deleting MinIO user
 	DeleteUserAdminAction = "admin:DeleteUser"
 	// ListUsersAdminAction - allow list users permission
@@ -84,6 +101,14 @@ const (
 	AttachPolicyAdminAction = "admin:AttachUserOrGroupPolicy"
 	// ListUserPoliciesAdminAction - allows listing user policies
 	ListUserPoliciesAdminAction = "admin:ListUserPolicies"
+
+	// Bucket quota Actions
+
+	// SetBucketQuotaAdminAction - allow setting bucket quota
+	SetBucketQuotaAdminAction = "admin:SetBucketQuota"
+	// GetBucketQuotaAdminAction - allow getting bucket quota
+	GetBucketQuotaAdminAction = "admin:GetBucketQuota"
+
 	// AllAdminActions - provides all admin permissions
 	AllAdminActions = "admin:*"
 )
@@ -92,7 +117,15 @@ const (
 var supportedAdminActions = map[AdminAction]struct{}{
 	AllAdminActions:                {},
 	HealAdminAction:                {},
-	ListServerInfoAdminAction:      {},
+	ServerInfoAdminAction:          {},
+	StorageInfoAdminAction:         {},
+	DataUsageInfoAdminAction:       {},
+	TopLocksAdminAction:            {},
+	ProfilingAdminAction:           {},
+	TraceAdminAction:               {},
+	OBDInfoAdminAction:             {},
+	ConsoleLogAdminAction:          {},
+	KMSKeyStatusAdminAction:        {},
 	ServerUpdateAdminAction:        {},
 	ConfigUpdateAdminAction:        {},
 	CreateUserAdminAction:          {},
@@ -110,6 +143,8 @@ var supportedAdminActions = map[AdminAction]struct{}{
 	DeletePolicyAdminAction:        {},
 	GetPolicyAdminAction:           {},
 	AttachPolicyAdminAction:        {},
+	SetBucketQuotaAdminAction:      {},
+	GetBucketQuotaAdminAction:      {},
 	ListUserPoliciesAdminAction:    {},
 }
 
@@ -119,7 +154,7 @@ func parseAdminAction(s string) (AdminAction, error) {
 		return action, nil
 	}
 
-	return action, fmt.Errorf("unsupported action '%v'", s)
+	return action, Errorf("unsupported action '%v'", s)
 }
 
 // IsValid - checks if action is valid or not.
@@ -132,7 +167,15 @@ func (action AdminAction) IsValid() bool {
 var adminActionConditionKeyMap = map[Action]condition.KeySet{
 	AllAdminActions:                condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	HealAdminAction:                condition.NewKeySet(condition.AllSupportedAdminKeys...),
-	ListServerInfoAdminAction:      condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	StorageInfoAdminAction:         condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	ServerInfoAdminAction:          condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	DataUsageInfoAdminAction:       condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	OBDInfoAdminAction:             condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	TopLocksAdminAction:            condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	ProfilingAdminAction:           condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	TraceAdminAction:               condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	ConsoleLogAdminAction:          condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	KMSKeyStatusAdminAction:        condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	ServerUpdateAdminAction:        condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	ConfigUpdateAdminAction:        condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	CreateUserAdminAction:          condition.NewKeySet(condition.AllSupportedAdminKeys...),
@@ -151,4 +194,6 @@ var adminActionConditionKeyMap = map[Action]condition.KeySet{
 	GetPolicyAdminAction:           condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	AttachPolicyAdminAction:        condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	ListUserPoliciesAdminAction:    condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	SetBucketQuotaAdminAction:      condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	GetBucketQuotaAdminAction:      condition.NewKeySet(condition.AllSupportedAdminKeys...),
 }

@@ -35,6 +35,8 @@ import (
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/auth"
+	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
+
 	"github.com/minio/minio/pkg/certs"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/pubsub"
@@ -94,6 +96,9 @@ const (
 
 	// Limit of location constraint XML for unauthenticted PUT bucket operations.
 	maxLocationConstraintSize = 3 * humanize.MiByte
+
+	// Maximum size of default bucket encryption configuration allowed
+	maxBucketSSEConfigSize = 1 * humanize.MiByte
 )
 
 var globalCLIContext = struct {
@@ -134,16 +139,26 @@ var (
 	globalMinioPort = globalMinioDefaultPort
 	// Holds the host that was passed using --address
 	globalMinioHost = ""
+	// Holds the possible host endpoint.
+	globalMinioEndpoint = ""
 
 	// globalConfigSys server config system.
 	globalConfigSys *ConfigSys
 
 	globalNotificationSys  *NotificationSys
 	globalConfigTargetList *event.TargetList
-	globalPolicySys        *PolicySys
-	globalIAMSys           *IAMSys
+	// globalEnvTargetList has list of targets configured via env.
+	globalEnvTargetList *event.TargetList
 
-	globalLifecycleSys *LifecycleSys
+	globalPolicySys *PolicySys
+	globalIAMSys    *IAMSys
+
+	globalLifecycleSys       *LifecycleSys
+	globalBucketSSEConfigSys *BucketSSEConfigSys
+
+	// globalAPIThrottling controls S3 requests throttling when
+	// enabled in the config or in the shell environment.
+	globalAPIThrottling apiThrottling
 
 	globalStorageClass storageclass.Config
 	globalLDAPConfig   xldap.Config
@@ -180,10 +195,13 @@ var (
 	// Global HTTP request statisitics
 	globalHTTPStats = newHTTPStats()
 
-	// Time when object layer was initialized on start up.
-	globalBootTime time.Time
+	// Time when the server is started
+	globalBootTime = UTCNow()
 
 	globalActiveCred auth.Credentials
+
+	// Hold the old server credentials passed by the environment
+	globalOldCred auth.Credentials
 
 	// Indicates if config is to be encrypted
 	globalConfigEncrypted bool
@@ -198,10 +216,10 @@ var (
 	globalOperationTimeout = newDynamicTimeout(10*time.Minute /*30*/, 600*time.Second)         // default timeout for general ops
 	globalHealingTimeout   = newDynamicTimeout(30*time.Minute /*1*/, 30*time.Minute)           // timeout for healing related ops
 
-	// Is worm enabled
-	globalWORMEnabled bool
+	globalBucketObjectLockConfig = objectlock.NewBucketObjectLockConfig()
 
-	globalBucketObjectLockConfig = newBucketObjectLockConfig()
+	globalBucketQuotaSys     *BucketQuotaSys
+	globalBucketStorageCache bucketStorageCache
 
 	// Disk cache drives
 	globalCacheConfig cache.Config
@@ -211,6 +229,10 @@ var (
 
 	// Allocated etcd endpoint for config and bucket DNS.
 	globalEtcdClient *etcd.Client
+
+	// Is set to true when Bucket federation is requested
+	// and is 'true' when etcdConfig.PathPrefix is empty
+	globalBucketFederation bool
 
 	// Allocated DNS config wrapper over etcd client.
 	globalDNSConfig *dns.CoreDNS
@@ -269,6 +291,7 @@ var (
 func getGlobalInfo() (globalInfo map[string]interface{}) {
 	globalInfo = map[string]interface{}{
 		"serverRegion": globalServerRegion,
+		"domains":      globalDomainNames,
 		// Add more relevant global settings here.
 	}
 

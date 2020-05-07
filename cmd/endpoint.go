@@ -17,8 +17,6 @@
 package cmd
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -30,7 +28,6 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/cli"
 	"github.com/minio/minio-go/v6/pkg/set"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
@@ -54,8 +51,7 @@ const (
 // Endpoint - any type of endpoint.
 type Endpoint struct {
 	*url.URL
-	IsLocal  bool
-	SetIndex int
+	IsLocal bool
 }
 
 func (endpoint Endpoint) String() string {
@@ -174,7 +170,11 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 		if isHostIP(arg) {
 			return ep, fmt.Errorf("invalid URL endpoint format: missing scheme http or https")
 		}
-		u = &url.URL{Path: path.Clean(arg)}
+		absArg, err := filepath.Abs(arg)
+		if err != nil {
+			return Endpoint{}, fmt.Errorf("absolute path failed %s", err)
+		}
+		u = &url.URL{Path: path.Clean(absArg)}
 		isLocal = true
 	}
 
@@ -195,6 +195,24 @@ type ZoneEndpoints struct {
 // EndpointZones - list of list of endpoints
 type EndpointZones []ZoneEndpoints
 
+// Add add zone endpoints
+func (l *EndpointZones) Add(zeps ZoneEndpoints) error {
+	existSet := set.NewStringSet()
+	for _, zep := range *l {
+		for _, ep := range zep.Endpoints {
+			existSet.Add(ep.String())
+		}
+	}
+	// Validate if there are duplicate endpoints across zones
+	for _, ep := range zeps.Endpoints {
+		if existSet.Contains(ep.String()) {
+			return fmt.Errorf("duplicate endpoints found")
+		}
+	}
+	*l = append(*l, zeps)
+	return nil
+}
+
 // FirstLocal returns true if the first endpoint is local.
 func (l EndpointZones) FirstLocal() bool {
 	return l[0].Endpoints[0].IsLocal
@@ -205,12 +223,26 @@ func (l EndpointZones) HTTPS() bool {
 	return l[0].Endpoints.HTTPS()
 }
 
-// Nodes - returns all nodes count
-func (l EndpointZones) Nodes() (count int) {
+// NEndpoints - returns all nodes count
+func (l EndpointZones) NEndpoints() (count int) {
 	for _, ep := range l {
 		count += len(ep.Endpoints)
 	}
 	return count
+}
+
+// Hosts - returns list of unique hosts
+func (l EndpointZones) Hosts() []string {
+	foundSet := set.NewStringSet()
+	for _, ep := range l {
+		for _, endpoint := range ep.Endpoints {
+			if foundSet.Contains(endpoint.Host) {
+				continue
+			}
+			foundSet.Add(endpoint.Host)
+		}
+	}
+	return foundSet.ToSlice()
 }
 
 // Endpoints - list of same type of endpoint.
@@ -230,23 +262,25 @@ func (endpoints Endpoints) GetString(i int) string {
 	return endpoints[i].String()
 }
 
-func (endpoints Endpoints) doAnyHostsResolveToLocalhost() bool {
-	for _, endpoint := range endpoints {
-		hostIPs, err := getHostIP(endpoint.Hostname())
-		if err != nil {
-			continue
-		}
-		var loopback int
-		for _, hostIP := range hostIPs.ToSlice() {
-			if net.ParseIP(hostIP).IsLoopback() {
-				loopback++
-			}
-		}
-		if loopback == len(hostIPs) {
-			return true
+func hostResolveToLocalhost(endpoint Endpoint) bool {
+	hostIPs, err := getHostIP(endpoint.Hostname())
+	if err != nil {
+		// Log the message to console about the host resolving
+		reqInfo := (&logger.ReqInfo{}).AppendTags(
+			"host",
+			endpoint.Hostname(),
+		)
+		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+		logger.LogIf(ctx, err, logger.Application)
+		return false
+	}
+	var loopback int
+	for _, hostIP := range hostIPs.ToSlice() {
+		if net.ParseIP(hostIP).IsLoopback() {
+			loopback++
 		}
 	}
-	return false
+	return loopback == len(hostIPs)
 }
 
 func (endpoints Endpoints) atleastOneEndpointLocal() bool {
@@ -294,8 +328,9 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 					endpoints[i].Hostname(),
 				)
 
-				if k8sReplicaSet && endpoints.doAnyHostsResolveToLocalhost() {
-					err := errors.New("host found resolves to 127.*, DNS incorrectly configured retrying")
+				if k8sReplicaSet && hostResolveToLocalhost(endpoints[i]) {
+					err := fmt.Errorf("host %s resolves to 127.*, DNS incorrectly configured retrying",
+						endpoints[i])
 					// time elapsed
 					timeElapsed := time.Since(startTime)
 					// log error only if more than 1s elapsed
@@ -305,7 +340,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 								startTime.Add(timeElapsed),
 								"elapsed",
 								""))
-						ctx := logger.SetReqInfo(context.Background(), reqInfo)
+						ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 						logger.LogIf(ctx, err, logger.Application)
 					}
 					continue
@@ -332,7 +367,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 								"elapsed",
 								"",
 							))
-						ctx := logger.SetReqInfo(context.Background(),
+						ctx := logger.SetReqInfo(GlobalContext,
 							reqInfo)
 						logger.LogIf(ctx, err, logger.Application)
 					}
@@ -352,6 +387,21 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 						// previous local we continue to wait to look for
 						// atleast one local.
 						resolvedList[i] = false
+						// time elapsed
+						err := fmt.Errorf("no endpoint is local to this host: %s", endpoints[i])
+						timeElapsed := time.Since(startTime)
+						// log error only if more than 1s elapsed
+						if timeElapsed > time.Second {
+							reqInfo.AppendTags("elapsedTime",
+								humanize.RelTime(startTime,
+									startTime.Add(timeElapsed),
+									"elapsed",
+									"",
+								))
+							ctx := logger.SetReqInfo(GlobalContext,
+								reqInfo)
+							logger.LogIf(ctx, err, logger.Application)
+						}
 						continue
 					}
 					epsResolved++
@@ -425,28 +475,6 @@ func NewEndpoints(args ...string) (endpoints Endpoints, err error) {
 	return endpoints, nil
 }
 
-func checkEndpointsSubOptimal(ctx *cli.Context, setupType SetupType, endpointZones EndpointZones) (err error) {
-	// Validate sub optimal ordering only for distributed setup.
-	if setupType != DistXLSetupType {
-		return nil
-	}
-	var endpointOrder int
-	err = fmt.Errorf("Too many disk args are local, input is in sub-optimal order. Please review input args: %s", ctx.Args())
-	for _, endpoints := range endpointZones {
-		for _, endpoint := range endpoints.Endpoints {
-			if endpoint.IsLocal {
-				endpointOrder++
-			} else {
-				endpointOrder--
-			}
-			if endpointOrder >= 2 {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // Checks if there are any cross device mounts.
 func checkCrossDeviceMounts(endpoints Endpoints) (err error) {
 	var absPaths []string
@@ -500,9 +528,8 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		return endpoints, setupType, nil
 	}
 
-	for i, iargs := range args {
+	for _, iargs := range args {
 		// Convert args to endpoints
-		var newEndpoints Endpoints
 		eps, err := NewEndpoints(iargs...)
 		if err != nil {
 			return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
@@ -513,11 +540,7 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 			return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
 		}
 
-		for _, ep := range eps {
-			ep.SetIndex = i
-			newEndpoints = append(newEndpoints, ep)
-		}
-		endpoints = append(endpoints, newEndpoints...)
+		endpoints = append(endpoints, eps...)
 	}
 
 	if len(endpoints) == 0 {
@@ -591,13 +614,14 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 
 	// All endpoints are pointing to local host
 	if len(endpoints) == localEndpointCount {
-		// If all endpoints have same port number, then this is XL setup using URL style endpoints.
+		// If all endpoints have same port number, Just treat it as distXL setup
+		// using URL style endpoints.
 		if len(localPortSet) == 1 {
 			if len(localServerHostSet) > 1 {
 				return endpoints, setupType,
 					config.ErrInvalidErasureEndpoints(nil).Msg("all local endpoints should not have different hostnames/ips")
 			}
-			return endpoints, XLSetupType, nil
+			return endpoints, DistXLSetupType, nil
 		}
 
 		// Even though all endpoints are local, but those endpoints use different ports.

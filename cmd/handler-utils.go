@@ -28,12 +28,18 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/handlers"
 	"github.com/minio/minio/pkg/madmin"
+)
+
+const (
+	copyDirective    = "COPY"
+	replaceDirective = "REPLACE"
 )
 
 // Parses location constraint from the incoming reader.
@@ -44,7 +50,7 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 	locationConstraint := createBucketLocationConfiguration{}
 	err := xmlDecoder(r.Body, &locationConstraint, r.ContentLength)
 	if err != nil && r.ContentLength != 0 {
-		logger.LogIf(context.Background(), err)
+		logger.LogIf(GlobalContext, err)
 		// Treat all other failures as XML parsing errors.
 		return "", ErrMalformedXML
 	} // else for both err as nil or io.EOF
@@ -69,47 +75,27 @@ var supportedHeaders = []string{
 	"content-encoding",
 	"content-disposition",
 	xhttp.AmzStorageClass,
+	xhttp.AmzObjectTagging,
 	"expires",
 	// Add more supported headers here.
 }
 
-// isMetadataDirectiveValid - check if metadata-directive is valid.
-func isMetadataDirectiveValid(h http.Header) bool {
-	_, ok := h[http.CanonicalHeaderKey(xhttp.AmzMetadataDirective)]
-	if ok {
-		// Check atleast set metadata-directive is valid.
-		return (isMetadataCopy(h) || isMetadataReplace(h))
-	}
-	// By default if x-amz-metadata-directive is not we
+// isDirectiveValid - check if tagging-directive is valid.
+func isDirectiveValid(v string) bool {
+	// Check if set metadata-directive is valid.
+	return isDirectiveCopy(v) || isDirectiveReplace(v)
+}
+
+// Check if the directive COPY is requested.
+func isDirectiveCopy(value string) bool {
+	// By default if directive is not set we
 	// treat it as 'COPY' this function returns true.
-	return true
+	return value == copyDirective || value == ""
 }
 
-// Check if the metadata COPY is requested.
-func isMetadataCopy(h http.Header) bool {
-	return h.Get(xhttp.AmzMetadataDirective) == "COPY"
-}
-
-// Check if the metadata REPLACE is requested.
-func isMetadataReplace(h http.Header) bool {
-	return h.Get(xhttp.AmzMetadataDirective) == "REPLACE"
-}
-
-// Splits an incoming path into bucket and object components.
-func path2BucketAndObject(path string) (bucket, object string) {
-	// Skip the first element if it is '/', split the rest.
-	path = strings.TrimPrefix(path, SlashSeparator)
-	pathComponents := strings.SplitN(path, SlashSeparator, 2)
-
-	// Save the bucket and object extracted from path.
-	switch len(pathComponents) {
-	case 1:
-		bucket = pathComponents[0]
-	case 2:
-		bucket = pathComponents[0]
-		object = pathComponents[1]
-	}
-	return bucket, object
+// Check if the directive REPLACE is requested.
+func isDirectiveReplace(value string) bool {
+	return value == replaceDirective
 }
 
 // userMetadataKeyPrefixes contains the prefixes of used-defined metadata keys.
@@ -195,7 +181,9 @@ func getReqAccessCred(r *http.Request, region string) (cred auth.Credentials) {
 		if owner {
 			return globalActiveCred
 		}
-		cred, _ = globalIAMSys.GetUser(claims.AccessKey())
+		if claims != nil {
+			cred, _ = globalIAMSys.GetUser(claims.AccessKey)
+		}
 	}
 	return cred
 }
@@ -352,34 +340,19 @@ func httpTraceHdrs(f http.HandlerFunc) http.HandlerFunc {
 
 func collectAPIStats(api string, f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		globalHTTPStats.currentS3Requests.Inc(api)
+		defer globalHTTPStats.currentS3Requests.Dec(api)
 
-		isS3Request := !strings.HasPrefix(r.URL.Path, minioReservedBucketPath)
-		apiStatsWriter := &recordAPIStats{w, UTCNow(), false, 0, isS3Request}
+		statsWriter := logger.NewResponseWriter(w)
 
-		// Time start before the call is about to start.
-		tBefore := UTCNow()
-
-		if isS3Request {
-			globalHTTPStats.currentS3Requests.Inc(api)
-		}
-		// Execute the request
-		f.ServeHTTP(apiStatsWriter, r)
-
-		if isS3Request {
-			globalHTTPStats.currentS3Requests.Dec(api)
-		}
-
-		// Firstbyte read.
-		tAfter := apiStatsWriter.TTFB
+		f.ServeHTTP(statsWriter, r)
 
 		// Time duration in secs since the call started.
-		//
 		// We don't need to do nanosecond precision in this
 		// simply for the fact that it is not human readable.
-		durationSecs := tAfter.Sub(tBefore).Seconds()
+		durationSecs := time.Since(statsWriter.StartTime).Seconds()
 
-		// Update http statistics
-		globalHTTPStats.updateStats(api, r, apiStatsWriter, durationSecs)
+		globalHTTPStats.updateStats(api, r, statsWriter, durationSecs)
 	}
 }
 
@@ -395,7 +368,7 @@ func getResource(path string, host string, domains []string) (string, error) {
 		if host, _, err = net.SplitHostPort(host); err != nil {
 			reqInfo := (&logger.ReqInfo{}).AppendTags("host", host)
 			reqInfo.AppendTags("path", path)
-			ctx := logger.SetReqInfo(context.Background(), reqInfo)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 			logger.LogIf(ctx, err)
 			return "", err
 		}

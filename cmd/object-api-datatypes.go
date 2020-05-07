@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"io"
+	"math"
 	"time"
 
 	"github.com/minio/minio/pkg/hash"
@@ -77,6 +78,11 @@ type objectHistogramInterval struct {
 	start, end int64
 }
 
+const (
+	// dataUsageBucketLen must be length of ObjectsHistogramIntervals
+	dataUsageBucketLen = 7
+)
+
 // ObjectsHistogramIntervals is the list of all intervals
 // of object sizes to be included in objects histogram.
 var ObjectsHistogramIntervals = []objectHistogramInterval{
@@ -86,20 +92,25 @@ var ObjectsHistogramIntervals = []objectHistogramInterval{
 	{"BETWEEN_10_MB_AND_64_MB", 1024 * 1024 * 10, 1024*1024*64 - 1},
 	{"BETWEEN_64_MB_AND_128_MB", 1024 * 1024 * 64, 1024*1024*128 - 1},
 	{"BETWEEN_128_MB_AND_512_MB", 1024 * 1024 * 128, 1024*1024*512 - 1},
-	{"GREATER_THAN_512_MB", 1024 * 1024 * 512, -1},
+	{"GREATER_THAN_512_MB", 1024 * 1024 * 512, math.MaxInt64},
 }
 
 // DataUsageInfo represents data usage stats of the underlying Object API
 type DataUsageInfo struct {
-	// The timestamp of when the data usage info is generated
+	// LastUpdate is the timestamp of when the data usage info was last updated.
+	// This does not indicate a full scan.
 	LastUpdate time.Time `json:"lastUpdate"`
 
 	ObjectsCount uint64 `json:"objectsCount"`
 	// Objects total size
-	ObjectsTotalSize      uint64            `json:"objectsTotalSize"`
+	ObjectsTotalSize uint64 `json:"objectsTotalSize"`
+
+	// ObjectsSizesHistogram contains information on objects across all buckets.
+	// See ObjectsHistogramIntervals.
 	ObjectsSizesHistogram map[string]uint64 `json:"objectsSizesHistogram"`
 
-	BucketsCount uint64            `json:"bucketsCount"`
+	BucketsCount uint64 `json:"bucketsCount"`
+	// BucketsSizes is "bucket name" -> size.
 	BucketsSizes map[string]uint64 `json:"bucketsSizes"`
 }
 
@@ -143,11 +154,19 @@ type ObjectInfo struct {
 	// Date and time at which the object is no longer able to be cached
 	Expires time.Time
 
+	// CacheStatus sets status of whether this is a cache hit/miss
+	CacheStatus CacheStatusType
+	// CacheLookupStatus sets whether a cacheable response is present in the cache
+	CacheLookupStatus CacheStatusType
+
 	// Specify object storage class
 	StorageClass string
 
 	// User-Defined metadata
 	UserDefined map[string]string
+
+	// User-Defined object tags
+	UserTags string
 
 	// List of individual parts, maximum size of upto 10,000
 	Parts []ObjectPartInfo `json:"-"`

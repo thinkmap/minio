@@ -121,6 +121,7 @@ drives*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
 expiry   (number)    cache expiry duration in days e.g. "90"
 quota    (number)    limit cache drive usage in percentage e.g. "90"
 exclude  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
+after    (number)    minimum number of access before caching an object
 comment  (sentence)  optionally add a comment to this setting
 ```
 
@@ -134,7 +135,61 @@ MINIO_CACHE_DRIVES*  (csv)       comma separated mountpoints e.g. "/optane1,/opt
 MINIO_CACHE_EXPIRY   (number)    cache expiry duration in days e.g. "90"
 MINIO_CACHE_QUOTA    (number)    limit cache drive usage in percentage e.g. "90"
 MINIO_CACHE_EXCLUDE  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
+MINIO_CACHE_AFTER    (number)    minimum number of access before caching an object
 MINIO_CACHE_COMMENT  (sentence)  optionally add a comment to this setting
+```
+
+#### Etcd
+MinIO supports storing encrypted IAM assets and bucket DNS records on etcd.
+
+> NOTE: if *path_prefix* is set then MinIO will not federate your buckets, namespaced IAM assets are assumed as isolated tenants, only buckets are considered globally unique but performing a lookup with a *bucket* which belongs to a different tenant will fail unlike federated setups where MinIO would port-forward and route the request to relevant cluster accordingly. This is a special feature, federated deployments should not need to set *path_prefix*.
+
+```
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+endpoints*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+path_prefix      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+coredns_path     (path)      shared bucket DNS records, default is "/skydns"
+client_cert      (path)      client cert for mTLS authentication
+client_cert_key  (path)      client cert key for mTLS authentication
+comment          (sentence)  optionally add a comment to this setting
+```
+
+or environment variables
+```
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+MINIO_ETCD_ENDPOINTS*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+MINIO_ETCD_PATH_PREFIX      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+MINIO_ETCD_COREDNS_PATH     (path)      shared bucket DNS records, default is "/skydns"
+MINIO_ETCD_CLIENT_CERT      (path)      client cert for mTLS authentication
+MINIO_ETCD_CLIENT_CERT_KEY  (path)      client cert key for mTLS authentication
+MINIO_ETCD_COMMENT          (sentence)  optionally add a comment to this setting
+```
+
+### API
+
+By default, there is no limitation on the number of concurrents requests that a server/cluster processes at the same time. However, it is possible to impose such limitation using the API subsystem. Read more about throttling limitation in MinIO server [here](https://github.com/minio/minio/blob/master/docs/throttle/README.md).
+
+```
+KEY:
+api  manage global HTTP API call specific features, such as throttling, authentication types, etc.
+
+ARGS:
+requests_max       (number)     set the maximum number of concurrent requests
+requests_deadline  (duration)   set the deadline for API requests waiting to be processed
+```
+
+or environment variables
+
+```
+MINIO_API_REQUESTS_MAX        (number)     set the maximum number of concurrent requests
+MINIO_API_REQUESTS_DEADLINE   (duration)   set the deadline for API requests waiting to be processed
+
 ```
 
 #### Notifications
@@ -153,18 +208,65 @@ notify_elasticsearch  publish bucket notifications to Elasticsearch endpoints
 notify_redis          publish bucket notifications to Redis datastores
 ```
 
-### Accessing configuration file
-All configuration changes can be made using [`mc admin config` get/set commands](https://github.com/minio/mc/blob/master/docs/minio-admin-complete-guide.md). Following sections provide brief explanation of fields and how to customize them. A complete example of `config.json` is available [here](https://raw.githubusercontent.com/minio/minio/master/docs/config/config.sample.json)
+### Accessing configuration
+All configuration changes can be made using [`mc admin config` get/set/reset/export/import commands](https://github.com/minio/mc/blob/master/docs/minio-admin-complete-guide.md).
 
-## Environment only settings
+#### List all config keys available
+```
+~ mc admin config set myminio/
+```
 
-#### Worm
-Enable this to turn on Write-Once-Read-Many. By default it is set to `off`. Set ``MINIO_WORM=on`` environment variable to enable WORM mode.
+#### Obtain help for each key
+```
+~ mc admin config set myminio/ <key>
+```
 
-Example:
+e.g: `mc admin config set myminio/ etcd` returns available `etcd` config args
+
+```
+~ mc admin config set play/ etcd
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+endpoints*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+path_prefix      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+coredns_path     (path)      shared bucket DNS records, default is "/skydns"
+client_cert      (path)      client cert for mTLS authentication
+client_cert_key  (path)      client cert key for mTLS authentication
+comment          (sentence)  optionally add a comment to this setting
+```
+
+To get ENV equivalent for each config args use `--env` flag
+```
+~ mc admin config set play/ etcd --env
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+MINIO_ETCD_ENDPOINTS*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+MINIO_ETCD_PATH_PREFIX      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+MINIO_ETCD_COREDNS_PATH     (path)      shared bucket DNS records, default is "/skydns"
+MINIO_ETCD_CLIENT_CERT      (path)      client cert for mTLS authentication
+MINIO_ETCD_CLIENT_CERT_KEY  (path)      client cert key for mTLS authentication
+MINIO_ETCD_COMMENT          (sentence)  optionally add a comment to this setting
+```
+
+This behavior is consistent across all keys, each key self documents itself with valid examples.
+
+## Environment only settings (not in config)
+
+#### Usage crawler
+Data usage crawler is enabled by default, following ENVs allow for more staggered delay in terms of usage calculation.
+
+The crawler adapts to the system speed and completely pauses when the system is under load. It is possible to adjust the speed of the crawler and thereby the latency of updates being reflected. The delays between each operation of the crawl can be adjusted by the `MINIO_DISK_USAGE_CRAWL_DELAY` environment variable. By default the value is `10`. This means the crawler will sleep *10x* the time each operation takes.
+
+This will in most setups make the crawler slow enough to not impact overall system performance. Setting `MINIO_DISK_USAGE_CRAWL_DELAY` to a *lower* value will make the crawler faster and setting it to 0 will make the crawler run at full speed (not recommended). Setting it to a higher value will make the crawler slower, further consume less resources.
+
+Example: Following setting will decrease the crawler speed by a factor of 3, reducing the system resource use, but increasing the latency of updates being reflected.
 
 ```sh
-export MINIO_WORM=on
+export MINIO_DISK_USAGE_CRAWL_DELAY=30
 minio server /data
 ```
 

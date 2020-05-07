@@ -190,7 +190,7 @@ func initFormatFS(ctx context.Context, fsPath string) (rlk *lock.RLockedFile, er
 	fsFormatPath := pathJoin(fsPath, minioMetaBucket, formatConfigFile)
 
 	// Add a deployment ID, if it does not exist.
-	if err := formatFSFixDeploymentID(fsFormatPath); err != nil {
+	if err := formatFSFixDeploymentID(ctx, fsFormatPath); err != nil {
 		return nil, err
 	}
 
@@ -288,7 +288,7 @@ func formatFSGetDeploymentID(rlk *lock.RLockedFile) (id string, err error) {
 }
 
 // Generate a deployment ID if one does not exist already.
-func formatFSFixDeploymentID(fsFormatPath string) error {
+func formatFSFixDeploymentID(ctx context.Context, fsFormatPath string) error {
 	rlk, err := lock.RLockedOpenFile(fsFormatPath)
 	if err == nil {
 		// format.json can be empty in a rare condition when another
@@ -339,21 +339,29 @@ func formatFSFixDeploymentID(fsFormatPath string) error {
 		return time.Now().Round(time.Second).Sub(formatStartTime).String()
 	}
 
-	doneCh := make(chan struct{})
-	defer close(doneCh)
+	retryCtx, cancel := context.WithCancel(ctx)
+	// Indicate to our routine to exit cleanly upon return.
+	defer cancel()
 
 	var wlk *lock.LockedFile
-	for range newRetryTimerSimple(doneCh) {
-		wlk, err = lock.TryLockedOpenFile(fsFormatPath, os.O_RDWR, 0)
-		if err == lock.ErrAlreadyLocked {
-			// Lock already present, sleep and attempt again
-			logger.Info("Another minio process(es) might be holding a lock to the file %s. Please kill that minio process(es) (elapsed %s)\n", fsFormatPath, getElapsedTime())
-			continue
+	retryCh := newRetryTimerSimple(retryCtx)
+	var stop bool
+	for !stop {
+		select {
+		case <-retryCh:
+			wlk, err = lock.TryLockedOpenFile(fsFormatPath, os.O_RDWR, 0)
+			if err == lock.ErrAlreadyLocked {
+				// Lock already present, sleep and attempt again
+				logger.Info("Another minio process(es) might be holding a lock to the file %s. Please kill that minio process(es) (elapsed %s)\n", fsFormatPath, getElapsedTime())
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			stop = true
+		case <-ctx.Done():
+			return fmt.Errorf("Initializing FS format stopped gracefully")
 		}
-		break
-	}
-	if err != nil {
-		return err
 	}
 
 	defer wlk.Close()

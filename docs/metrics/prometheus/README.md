@@ -120,13 +120,13 @@ The list of metrics and its definition are as follows. (NOTE: instance here is o
 
 - standard go runtime metrics prefixed by `go_`
 - process level metrics prefixed with `process_`
-- prometheus scrap metrics prefixed with `promhttp_`
+- prometheus scrape metrics prefixed with `promhttp_`
 
 - `disk_storage_used` : Disk space used by the disk.
 - `disk_storage_available`: Available disk space left on the disk.
 - `disk_storage_total`: Total disk space on the disk.
-- `disks_offline`: Total number of offline disks in current MinIO instance.
-- `disks_total`: Total number of disks in current MinIO instance.
+- `minio_disks_offline`: Total number of offline disks in current MinIO instance.
+- `minio_disks_total`: Total number of disks in current MinIO instance.
 - `s3_requests_total`: Total number of s3 requests in current MinIO instance.
 - `s3_errors_total`: Total number of errors in s3 requests in current MinIO instance.
 - `s3_requests_current`: Total number of active s3 requests in current MinIO instance.
@@ -147,13 +147,24 @@ MinIO Gateway instances enabled with Disk-Caching expose caching related metrics
 - `cache_hits_total`: Total number of cache hits.
 - `cache_misses_total`: Total number of cache misses.
 
-### S3 Gateway & Cache specific metrics
+### Gateway & Cache specific metrics
 
-MinIO S3 Gateway instance exposes metrics related to Gateway communication with AWS S3.
+MinIO Gateway instance exposes metrics related to Gateway communication with the cloud backend (S3, Azure & GCS Gateway).
 
-- `gateway_s3_requests`: Total number of GET & HEAD requests made to AWS S3. This metrics has a label `method` that identifies GET & HEAD Requests.
-- `gateway_s3_bytes_sent`: Total number of bytes sent to AWS S3 (in GET & HEAD Requests).
-- `gateway_s3_bytes_received`: Total number of bytes received from AWS S3 (in GET & HEAD Requests).
+- `gateway_<gateway_type>_requests`: Total number of requests made to cloud backend. This metrics has a label `method` that identifies GET, HEAD, PUT and POST Requests.
+- `gateway_<gateway_type>_bytes_sent`: Total number of bytes sent to cloud backend (in PUT & POST Requests).
+- `gateway_<gateway_type>_bytes_received`: Total number of bytes received from cloud backend (in GET & HEAD Requests).
+
+Note that this is currently only support for Azure, S3 and GCS Gateway.
+
+### MinIO self-healing metrics - `self_heal_*`
+
+MinIO exposes self-healing related metrics for erasure-code deployments _only_. These metrics are _not_ available on Gateway or Single Node, Single Drive deployments. Note that these metrics will be exposed _only_ when there is a relevant event happening on MinIO server.
+
+- `self_heal_time_since_last_activity`: Time elapsed since last self-healing related activity.
+- `self_heal_objects_scanned`: Number of objects scanned by self-healing thread in its current run. This will reset when a fresh self-healing run starts. This is labeled with the object type scanned.
+- `self_heal_objects_healed`: Number of objects healing by self-healing thread in its current run. This will reset when a fresh self-healing run starts. This is labeled with the object type scanned.
+- `self_heal_objects_heal_failed`: Number of objects for which self-healing failed in its current run. This will reset when a fresh self-healing run starts. This is labeled with disk status and its endpoint.
 
 ## Migration guide for the new set of metrics
 
@@ -163,8 +174,8 @@ This migration guide applies for older releases or any releases before `RELEASE.
 
 The migrations include
 
-    - `minio_total_disks` to `disks_total`
-    - `minio_offline_disks` to `disks_offline`
+    - `minio_total_disks` to `minio_disks_total`
+    - `minio_offline_disks` to `minio_disks_offline`
 
 ### MinIO disk level metrics - `disk_storage_*`
 
